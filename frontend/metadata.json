@@ -1,5 +1,5 @@
 {
-  "name": "LegalAI Assistant",
+  "name": "casemate Assistant",
   "description": "An AI-powered legal copilot for analyzing case files and drafting documents.",
   "requestFramePermissions": [
     "microphone"

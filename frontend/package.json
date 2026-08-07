@@ -9,10 +9,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "latest",
-    "react-dom": "latest",
+    "@emailjs/browser": "^4.4.1",
     "@google/genai": "latest",
-    "docx": "latest"
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "docx": "latest",
+    "firebase": "^12.17.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@types/node": "latest",

@@ -1,55 +1,15 @@
 import React from 'react';
 import { useAppContext } from '../context/AppContext';
-import { XIcon, CheckIcon } from './Icons';
+import { XIcon } from './Icons';
 import { translations } from '../utils/translations';
 
 export const SettingsModal = () => {
-  const { isSettingsOpen, setIsSettingsOpen, language, setLanguage, user, upgradeToPro } = useAppContext();
+  const { isSettingsOpen, setIsSettingsOpen, language, setLanguage, user } = useAppContext();
 
   if (!isSettingsOpen) return null;
 
   const t = translations[language] || translations['English'];
   const languages = ['English', 'Hindi'];
-
-  const handlePayment = () => {
-    const options = {
-      key: "rzp_test_123456789", // Placeholder test key
-      amount: "99900", // ₹999.00
-      currency: "INR",
-      name: "LegalAI Assistant",
-      description: "Pro Plan Subscription",
-      handler: function (response: any) {
-        // Real success callback
-        upgradeToPro();
-      },
-      prefill: {
-        name: user?.name || "",
-        email: user?.email || "",
-      },
-      theme: { color: "#2563eb" }
-    };
-
-    if ((window as any).Razorpay) {
-      try {
-        const rzp = new (window as any).Razorpay(options);
-        rzp.on('payment.failed', function (response: any){
-          // Since we are using a placeholder key, it will likely fail. 
-          // We simulate success here for the demo environment.
-          console.warn("Payment Failed: " + response.error.description);
-          alert("Payment Failed: " + response.error.description + "\n\nSimulating successful payment for demo purposes.");
-          upgradeToPro();
-        });
-        rzp.open();
-      } catch (e) {
-        console.warn("Razorpay error", e);
-        // Fallback simulation
-        upgradeToPro();
-      }
-    } else {
-      alert("Razorpay SDK not loaded. Simulating successful payment for demo.");
-      upgradeToPro();
-    }
-  };
 
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 backdrop-blur-sm p-4">
@@ -81,38 +41,20 @@ export const SettingsModal = () => {
           <section>
             <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">{t.subAndBilling}</h3>
             
-            <div className={`border rounded-xl p-5 ${user?.plan === 'pro' ? 'border-blue-900 bg-blue-900/20' : 'border-slate-700 bg-slate-800/50'}`}>
-              <div className="flex justify-between items-start mb-4">
+            <div className="border rounded-xl p-5 border-slate-700 bg-slate-800/50">
+              <div className="flex justify-between items-start">
                 <div>
-                  <div className="font-bold text-lg text-white capitalize">{user?.plan} {t.plan}</div>
-                  <div className="text-sm text-slate-400">
-                    {user?.plan === 'free' ? t.freeLimit : t.unlimitedAccess}
+                  <div className="font-bold text-lg text-white capitalize">
+                    {user?.plan || 'Free'} {t.plan}
+                  </div>
+                  <div className="text-sm text-slate-400 mt-1">
+                    {(!user?.plan || user?.plan === 'free') ? t.freeLimit : t.unlimitedAccess}
                   </div>
                 </div>
-                {user?.plan === 'pro' && (
-                  <span className="bg-blue-900/50 text-blue-400 border border-blue-800 text-xs font-bold px-2.5 py-1 rounded-full uppercase tracking-wide">{t.active}</span>
-                )}
+                <span className="bg-blue-900/50 text-blue-400 border border-blue-800 text-xs font-bold px-2.5 py-1 rounded-full uppercase tracking-wide">
+                  {t.active}
+                </span>
               </div>
-
-              {user?.plan === 'free' && (
-                <div className="mt-4 pt-4 border-t border-slate-700">
-                  <div className="flex items-baseline gap-1 mb-4">
-                    <span className="text-3xl font-extrabold text-white">₹999</span>
-                    <span className="text-slate-400 font-medium">{t.month}</span>
-                  </div>
-                  <ul className="space-y-2 mb-5 text-sm text-slate-300">
-                    <li className="flex items-center gap-2"><CheckIcon className="w-4 h-4 text-green-500"/> {t.feature1}</li>
-                    <li className="flex items-center gap-2"><CheckIcon className="w-4 h-4 text-green-500"/> {t.feature2}</li>
-                    <li className="flex items-center gap-2"><CheckIcon className="w-4 h-4 text-green-500"/> {t.feature3}</li>
-                  </ul>
-                  <button 
-                    onClick={handlePayment}
-                    className="w-full bg-blue-600 text-white py-2.5 rounded-xl font-medium hover:bg-blue-700 transition-colors shadow-sm"
-                  >
-                    {t.payWithRazorpay}
-                  </button>
-                </div>
-              )}
             </div>
           </section>
         </div>

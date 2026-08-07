@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { UsersIcon, ActivityIcon, LogoutIcon, ScaleIcon, SettingsIcon, XIcon, EditIcon } from './Icons';
+import { UsersIcon, ActivityIcon, LogoutIcon, ScaleIcon, SettingsIcon, XIcon, EditIcon, PlusIcon } from './Icons';
 import { translations } from '../utils/translations';
+import { saveCloudAdminConfig } from '../services/adminConfigService';
 
 interface UserStats {
   id: string;
@@ -18,6 +19,7 @@ interface PlanConfig {
   id: string;
   name: string;
   price: number;
+  features: string[];
 }
 
 export const AdminDashboard = () => {
@@ -32,21 +34,29 @@ export const AdminDashboard = () => {
   const [adminEmail, setAdminEmail] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
 
-  // Dynamic Plans
+  // Dynamic Plans with customizable features & add/remove support
   const [plans, setPlans] = useState<PlanConfig[]>([
-    { id: 'basic', name: 'Basic Plan', price: 699 },
-    { id: 'pro', name: 'Pro Plan', price: 1299 },
-    { id: 'annual', name: 'Annual Plan', price: 4999 }
+    { id: 'basic', name: 'Basic Plan', price: 699, features: ['Unlimited chat analysis', 'Standard document export'] },
+    { id: 'pro', name: 'Pro Plan', price: 1299, features: ['Unlimited chat analysis', 'Priority AI processing', 'Advanced DOCX/PDF export'] },
+    { id: 'annual', name: 'Annual Plan', price: 4999, features: ['All Pro features', '24/7 VIP Support', 'Custom templates access'] }
   ]);
 
-  // API, Payment & Gemini AI Keys State
+  // API, Payment, Firebase & EmailJS Keys State
   const [keysConfig, setKeysConfig] = useState({
     geminiApiKey: '',
     razorpayKeyId: '',
     razorpayKeySecret: '',
     firebaseApiKey: '',
     firebaseProjectId: '',
-    emailServiceKey: ''
+    authDomain: '',
+    storageBucket: '',
+    messagingSenderId: '',
+    appId: '',
+    emailServiceId: '',
+    emailPublicKey: '',
+    welcomeTemplateId: '',
+    purchaseTemplateId: '',
+    expiryTemplateId: ''
   });
 
   // Announcement State
@@ -56,34 +66,34 @@ export const AdminDashboard = () => {
     loadUsers();
 
     // Load credentials
-    const creds = JSON.parse(localStorage.getItem('legalai_admin_creds') || '{"email":"admin@legalai.com","password":"admin123"}');
+    const creds = JSON.parse(localStorage.getItem('casemate_admin_creds') || '{"email":"admin@casemate.com","password":"admin123"}');
     setAdminEmail(creds.email);
     setAdminPassword(creds.password);
 
     // Load plans
-    const savedPlans = localStorage.getItem('legalai_subscription_plans');
+    const savedPlans = localStorage.getItem('casemate_subscription_plans');
     if (savedPlans) {
       try { setPlans(JSON.parse(savedPlans)); } catch (e) { console.error(e); }
     }
 
-    // Load API/Payment & Gemini Keys
-    const savedKeys = localStorage.getItem('legalai_api_keys');
+    // Load API/Payment, Firebase & EmailJS Keys
+    const savedKeys = localStorage.getItem('casemate_api_keys');
     if (savedKeys) {
       try { setKeysConfig(JSON.parse(savedKeys)); } catch (e) { console.error(e); }
     }
 
     // Load Announcement
-    const savedAnnouncement = localStorage.getItem('legalai_announcement') || '';
+    const savedAnnouncement = localStorage.getItem('casemate_announcement') || '';
     setAnnouncementText(savedAnnouncement);
   }, []);
 
   const loadUsers = () => {
-    const usersDb = JSON.parse(localStorage.getItem('legalai_users_db') || '[]');
-    const blockedUsers = JSON.parse(localStorage.getItem('legalai_blocked_users') || '[]');
+    const usersDb = JSON.parse(localStorage.getItem('casemate_users_db') || '[]');
+    const blockedUsers = JSON.parse(localStorage.getItem('casemate_blocked_users') || '[]');
     
     const userStats = usersDb.map((u: any) => {
-      const chats = JSON.parse(localStorage.getItem(`legalai_chats_${u.id}`) || '[]');
-      const usage = JSON.parse(localStorage.getItem(`legalai_usage_${u.id}`) || '3600');
+      const chats = JSON.parse(localStorage.getItem(`casemate_chats_${u.id}`) || '[]');
+      const usage = JSON.parse(localStorage.getItem(`casemate_usage_${u.id}`) || '3600');
       
       let docCount = 0;
       chats.forEach((c: any) => {
@@ -107,42 +117,79 @@ export const AdminDashboard = () => {
   };
 
   const toggleBlockUser = (userId: string) => {
-    let blockedUsers = JSON.parse(localStorage.getItem('legalai_blocked_users') || '[]');
+    let blockedUsers = JSON.parse(localStorage.getItem('casemate_blocked_users') || '[]');
     if (blockedUsers.includes(userId)) {
       blockedUsers = blockedUsers.filter((id: string) => id !== userId);
     } else {
       blockedUsers.push(userId);
     }
-    localStorage.setItem('legalai_blocked_users', JSON.stringify(blockedUsers));
+    localStorage.setItem('casemate_blocked_users', JSON.stringify(blockedUsers));
     loadUsers();
   };
 
   const handleSaveCreds = (e: React.FormEvent) => {
     e.preventDefault();
-    localStorage.setItem('legalai_admin_creds', JSON.stringify({ email: adminEmail, password: adminPassword }));
+    localStorage.setItem('casemate_admin_creds', JSON.stringify({ email: adminEmail, password: adminPassword }));
     setShowSettings(false);
     alert("Admin credentials updated successfully.");
   };
 
   const handleSavePlans = (e: React.FormEvent) => {
     e.preventDefault();
-    localStorage.setItem('legalai_subscription_plans', JSON.stringify(plans));
+    localStorage.setItem('casemate_subscription_plans', JSON.stringify(plans));
     setShowPlansModal(false);
     alert("Subscription plans updated successfully.");
   };
 
-  const handleSaveKeys = (e: React.FormEvent) => {
+  const handleSaveKeys = async (e: React.FormEvent) => {
     e.preventDefault();
-    localStorage.setItem('legalai_api_keys', JSON.stringify(keysConfig));
+    
+    // 1. LocalStorage mein save karo
+    localStorage.setItem('casemate_api_keys', JSON.stringify(keysConfig));
+    
+    // 2. Firestore par bhi sync karo taaki saare devices/phones par cloud se load ho sake
+    try {
+      await saveCloudAdminConfig('api_keys', {
+        geminiApiKey: keysConfig.geminiApiKey,
+        razorpayKeyId: keysConfig.razorpayKeyId,
+        razorpayKeySecret: keysConfig.razorpayKeySecret
+      });
+
+      await saveCloudAdminConfig('email_keys', {
+        serviceId: keysConfig.emailServiceId,
+        publicKey: keysConfig.emailPublicKey,
+        welcomeTemplateId: keysConfig.welcomeTemplateId,
+        purchaseTemplateId: keysConfig.purchaseTemplateId,
+        expiryTemplateId: keysConfig.expiryTemplateId
+      });
+    } catch (err) {
+      console.error("Error saving keys to cloud:", err);
+    }
+
     setShowKeysModal(false);
-    alert("API, Payment & Gemini keys updated successfully.");
+    alert("API, Payment, Firebase & EmailJS keys updated successfully to Cloud & Local!");
   };
 
   const handleSaveAnnouncement = (e: React.FormEvent) => {
     e.preventDefault();
-    localStorage.setItem('legalai_announcement', announcementText);
+    localStorage.setItem('casemate_announcement', announcementText);
     setShowAnnouncementModal(false);
     alert("Global announcement broadcasted successfully.");
+  };
+
+  const addPlan = () => {
+    const newPlan: PlanConfig = {
+      id: `plan_${Date.now()}`,
+      name: 'New Plan',
+      price: 999,
+      features: ['Feature 1', 'Feature 2']
+    };
+    setPlans([...plans, newPlan]);
+  };
+
+  const removePlan = (index: number) => {
+    const updated = plans.filter((_, i) => i !== index);
+    setPlans(updated);
   };
 
   const totalUsers = stats.length;
@@ -175,7 +222,7 @@ export const AdminDashboard = () => {
             onClick={() => setShowKeysModal(true)}
             className="flex items-center gap-1.5 px-3 py-2 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/30 rounded-lg text-xs font-medium transition-colors"
           >
-            <SettingsIcon className="w-4 h-4" /> API & Gemini Keys
+            <SettingsIcon className="w-4 h-4" /> API & Keys
           </button>
           <button 
             onClick={() => setShowAnnouncementModal(true)}
@@ -292,20 +339,43 @@ export const AdminDashboard = () => {
         </div>
       </main>
 
-      {/* 1. Manage Plans Modal */}
+      {/* 1. Manage Plans Modal with Add/Remove & Features */}
       {showPlansModal && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center z-[100] backdrop-blur-sm p-4">
-          <div className="bg-slate-900 p-8 rounded-3xl max-w-lg w-full shadow-2xl relative border border-slate-800">
+          <div className="bg-slate-900 p-8 rounded-3xl max-w-xl w-full shadow-2xl relative border border-slate-800 max-h-[90vh] overflow-y-auto custom-scrollbar">
             <button onClick={() => setShowPlansModal(false)} className="absolute top-4 right-4 text-slate-400 hover:text-white">
               <XIcon className="w-6 h-6" />
             </button>
-            <h2 className="text-xl font-bold text-white mb-2">Manage Subscription Plans</h2>
-            <p className="text-xs text-slate-400 mb-6">Configure pricing for Basic, Pro, and Annual packages.</p>
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-xl font-bold text-white">Manage Subscription Plans</h2>
+                <p className="text-xs text-slate-400">Add, remove or customize plans and their features.</p>
+              </div>
+              <button 
+                type="button"
+                onClick={addPlan}
+                className="flex items-center gap-1 bg-purple-600 hover:bg-purple-700 text-white text-xs px-3 py-2 rounded-xl font-medium transition-colors"
+              >
+                <PlusIcon className="w-4 h-4" /> Add Plan
+              </button>
+            </div>
             
             <form onSubmit={handleSavePlans} className="space-y-4">
               {plans.map((p, index) => (
-                <div key={p.id} className="bg-slate-800/50 p-4 rounded-2xl border border-slate-800 space-y-3">
-                  <span className="text-xs font-bold uppercase tracking-wider text-purple-400">Package {index + 1}</span>
+                <div key={p.id || index} className="bg-slate-800/50 p-4 rounded-2xl border border-slate-800 space-y-3 relative">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold uppercase tracking-wider text-purple-400">Package {index + 1}</span>
+                    {plans.length > 1 && (
+                      <button 
+                        type="button" 
+                        onClick={() => removePlan(index)}
+                        className="text-red-400 hover:text-red-300 text-xs font-medium px-2 py-1 bg-red-950/30 rounded border border-red-900/50 transition-colors"
+                      >
+                        Remove Plan
+                      </button>
+                    )}
+                  </div>
+                  
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-medium text-slate-400 mb-1">Plan Name</label>
@@ -336,29 +406,44 @@ export const AdminDashboard = () => {
                       />
                     </div>
                   </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1">Features (Comma-separated)</label>
+                    <input
+                      type="text"
+                      placeholder="Feature 1, Feature 2, Feature 3"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
+                      defaultValue={Array.isArray(p.features) ? p.features.join(', ') : ''}
+                      onBlur={(e) => {
+                        const updated = [...plans];
+                        updated[index].features = e.target.value.split(',').map(f => f.trim()).filter(Boolean);
+                        setPlans(updated);
+                      }}
+                    />
+                  </div>
                 </div>
               ))}
               <button type="submit" className="mt-4 w-full bg-purple-600 hover:bg-purple-700 text-white py-3 rounded-xl font-medium transition-colors">
-                Save Plans
+                Save Plans & Features
               </button>
             </form>
           </div>
         </div>
       )}
 
-      {/* 2. API, Razorpay & Gemini Keys Modal */}
+      {/* 2. API, Razorpay, Firebase & EmailJS Keys Modal */}
       {showKeysModal && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center z-[100] backdrop-blur-sm p-4">
           <div className="bg-slate-900 p-8 rounded-3xl max-w-lg w-full shadow-2xl relative border border-slate-800 max-h-[90vh] overflow-y-auto">
             <button onClick={() => setShowKeysModal(false)} className="absolute top-4 right-4 text-slate-400 hover:text-white">
               <XIcon className="w-6 h-6" />
             </button>
-            <h2 className="text-xl font-bold text-white mb-2">API, Payment & Gemini Keys</h2>
-            <p className="text-xs text-slate-400 mb-6">Manage Gemini AI API Key, Razorpay, and Firebase keys dynamically.</p>
+            <h2 className="text-xl font-bold text-white mb-2">API, Payment, Firebase & EmailJS Keys</h2>
+            <p className="text-xs text-slate-400 mb-6">Manage Gemini AI, Razorpay, Firebase, and EmailJS configuration.</p>
             
             <form onSubmit={handleSaveKeys} className="space-y-4">
               <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1 text-blue-400 font-semibold">Gemini AI API Key (AQ...)</label>
+                <label className="block text-xs font-medium text-slate-400 mb-1 text-blue-400 font-semibold">Gemini AI API Key</label>
                 <input
                   type="text"
                   placeholder="AQ..."
@@ -401,22 +486,108 @@ export const AdminDashboard = () => {
                 <label className="block text-xs font-medium text-slate-400 mb-1">Firebase Project ID</label>
                 <input
                   type="text"
-                  placeholder="legalai-app"
+                  placeholder="casemate-78759"
                   className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
                   value={keysConfig.firebaseProjectId}
                   onChange={(e) => setKeysConfig({...keysConfig, firebaseProjectId: e.target.value})}
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1">Email Service Key / JS Token</label>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Auth Domain</label>
                 <input
                   type="text"
-                  placeholder="Email service token"
+                  placeholder="casemate-78759.firebaseapp.com"
                   className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
-                  value={keysConfig.emailServiceKey}
-                  onChange={(e) => setKeysConfig({...keysConfig, emailServiceKey: e.target.value})}
+                  value={keysConfig.authDomain}
+                  onChange={(e) => setKeysConfig({...keysConfig, authDomain: e.target.value})}
                 />
               </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Storage Bucket</label>
+                <input
+                  type="text"
+                  placeholder="casemate-78759.firebasestorage.app"
+                  className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
+                  value={keysConfig.storageBucket}
+                  onChange={(e) => setKeysConfig({...keysConfig, storageBucket: e.target.value})}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Messaging Sender ID</label>
+                <input
+                  type="text"
+                  placeholder="556075485433"
+                  className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
+                  value={keysConfig.messagingSenderId}
+                  onChange={(e) => setKeysConfig({...keysConfig, messagingSenderId: e.target.value})}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">App ID</label>
+                <input
+                  type="text"
+                  placeholder="1:556075485433:web:..."
+                  className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
+                  value={keysConfig.appId}
+                  onChange={(e) => setKeysConfig({...keysConfig, appId: e.target.value})}
+                />
+              </div>
+
+              {/* EmailJS Fields */}
+              <div className="border-t border-slate-800 pt-4 mt-4 space-y-4">
+                <h3 className="text-sm font-semibold text-amber-400">EmailJS Configuration</h3>
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">EmailJS Service ID</label>
+                  <input
+                    type="text"
+                    placeholder="service_xxxxx"
+                    className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
+                    value={keysConfig.emailServiceId}
+                    onChange={(e) => setKeysConfig({...keysConfig, emailServiceId: e.target.value})}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">EmailJS Public Key</label>
+                  <input
+                    type="text"
+                    placeholder="Public key string"
+                    className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
+                    value={keysConfig.emailPublicKey}
+                    onChange={(e) => setKeysConfig({...keysConfig, emailPublicKey: e.target.value})}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">Welcome Email Template ID</label>
+                  <input
+                    type="text"
+                    placeholder="template_xxxxx"
+                    className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
+                    value={keysConfig.welcomeTemplateId}
+                    onChange={(e) => setKeysConfig({...keysConfig, welcomeTemplateId: e.target.value})}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">Plan Purchase Email Template ID</label>
+                  <input
+                    type="text"
+                    placeholder="template_xxxxx"
+                    className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
+                    value={keysConfig.purchaseTemplateId}
+                    onChange={(e) => setKeysConfig({...keysConfig, purchaseTemplateId: e.target.value})}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">Expiry Alert Email Template ID</label>
+                  <input
+                    type="text"
+                    placeholder="template_xxxxx"
+                    className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm outline-none"
+                    value={keysConfig.expiryTemplateId}
+                    onChange={(e) => setKeysConfig({...keysConfig, expiryTemplateId: e.target.value})}
+                  />
+                </div>
+              </div>
+
               <button type="submit" className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-medium transition-colors">
                 Save All Keys
               </button>
@@ -459,7 +630,7 @@ export const AdminDashboard = () => {
       {showSettings && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center z-[100] backdrop-blur-sm p-4">
           <div className="bg-slate-900 p-8 rounded-3xl max-w-md w-full shadow-2xl relative border border-slate-800">
-            <button onClick={() => setShowSettings, setShowSettings(false)} className="absolute top-4 right-4 text-slate-400 hover:text-white">
+            <button onClick={() => setShowSettings(false)} className="absolute top-4 right-4 text-slate-400 hover:text-white">
               <XIcon className="w-6 h-6" />
             </button>
             <h2 className="text-xl font-bold text-white mb-6">{t.changeAdminCreds}</h2>

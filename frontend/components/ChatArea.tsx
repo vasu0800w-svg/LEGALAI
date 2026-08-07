@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { generateLegalResponse } from '../services/geminiService';
-import { PaperclipIcon, TemplateIcon, SendIcon, SparklesIcon, XIcon, UserIcon, BotIcon, MenuIcon, MicIcon, DocxIcon, PdfIcon, EditIcon } from './Icons';
+import { PaperclipIcon, TemplateIcon, SendIcon, SparklesIcon, XIcon, UserIcon, BotIcon, MenuIcon, MicIcon, DocxIcon, PdfIcon, EditIcon, SearchIcon } from './Icons';
 import { Message } from '../types';
 import { translations } from '../utils/translations';
 import { PREDEFINED_TEMPLATES } from '../utils/templates';
@@ -219,7 +219,7 @@ const DocumentViewer = ({ msg, title, t, onUpdate }: { msg: Message, title: stri
           const leftText = (parts[0] || '').trim();
           const rightText = (parts[1] || '').trim();
 
-          const createCellParagraphs = (text: string, align: AlignmentType) => {
+          const createCellParagraphs = (text: string, align: any) => {
             return text.split('<br>').map(t => new Paragraph({ children: createRuns(t), alignment: align }));
           };
 
@@ -256,7 +256,7 @@ const DocumentViewer = ({ msg, title, t, onUpdate }: { msg: Message, title: stri
           continue;
         }
 
-        let alignment = AlignmentType.LEFT;
+        let alignment: any = AlignmentType.LEFT;
         if (currentLine.toUpperCase().includes('[CENTER]')) {
           alignment = AlignmentType.CENTER;
           currentLine = currentLine.replace(/\[\/?CENTER\]/gi, '');
@@ -428,6 +428,7 @@ export const ChatArea = () => {
   const [formatFiles, setFormatFiles] = useState<File[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [showTemplateMenu, setShowTemplateMenu] = useState(false);
+  const [templateSearchQuery, setTemplateSearchQuery] = useState(''); // Template search query state
   const [isLoading, setIsLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [globalAnnouncement, setGlobalAnnouncement] = useState('');
@@ -441,7 +442,7 @@ export const ChatArea = () => {
 
   // Load announcement from admin panel broadcast if any
   useEffect(() => {
-    const ann = localStorage.getItem('legalai_announcement');
+    const ann = localStorage.getItem('casemate_announcement');
     if (ann) {
       setGlobalAnnouncement(ann);
     }
@@ -453,6 +454,11 @@ export const ChatArea = () => {
     { id: 'divorce', name: t.divorcePetition },
     { id: 'nda', name: t.nda }
   ];
+
+  // Filter templates based on search input
+  const filteredTemplates = templateOptions.filter(opt => 
+    opt.name.toLowerCase().includes(templateSearchQuery.toLowerCase())
+  );
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -533,6 +539,7 @@ export const ChatArea = () => {
     setSelectedTemplateId(id);
     setFormatFiles([]); // Clear files if predefined template is selected
     setShowTemplateMenu(false);
+    setTemplateSearchQuery('');
   };
 
   const removeCaseFile = (index: number) => {
@@ -813,16 +820,36 @@ export const ChatArea = () => {
                   </button>
                   
                   {showTemplateMenu && (
-                    <div className="absolute bottom-full left-0 mb-2 w-56 bg-slate-800 border border-slate-700 rounded-xl shadow-xl overflow-hidden z-50">
-                      {templateOptions.map(option => (
-                        <button
-                          key={option.id}
-                          onClick={() => handleTemplateSelect(option.id)}
-                          className="w-full text-left px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-700 hover:text-white transition-colors border-b border-slate-700/50 last:border-0"
-                        >
-                          {option.name}
-                        </button>
-                      ))}
+                    <div className="absolute bottom-full left-0 mb-2 w-64 bg-slate-800 border border-slate-700 rounded-xl shadow-xl overflow-hidden z-50 p-2 space-y-2">
+                      <div className="relative">
+                        <span className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-slate-400">
+                          <SearchIcon className="w-3.5 h-3.5" />
+                        </span>
+                        <input
+                          type="text"
+                          value={templateSearchQuery}
+                          onChange={(e) => setTemplateSearchQuery(e.target.value)}
+                          placeholder="Search templates..."
+                          className="w-full bg-slate-900 border border-slate-700 text-white text-xs rounded-lg pl-8 pr-3 py-1.5 outline-none focus:border-blue-500"
+                          autoFocus
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                      </div>
+                      <div className="max-h-48 overflow-y-auto space-y-1 custom-scrollbar">
+                        {filteredTemplates.length > 0 ? (
+                          filteredTemplates.map(option => (
+                            <button
+                              key={option.id}
+                              onClick={() => handleTemplateSelect(option.id)}
+                              className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-slate-700 hover:text-white rounded-lg transition-colors"
+                            >
+                              {option.name}
+                            </button>
+                          ))
+                        ) : (
+                          <div className="px-3 py-2 text-xs text-slate-500 text-center">No templates found</div>
+                        )}
+                      </div>
                     </div>
                   )}
                 </div>

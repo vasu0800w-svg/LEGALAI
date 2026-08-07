@@ -2,27 +2,33 @@ import React, { useEffect, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { CheckIcon, XIcon, SparklesIcon } from './Icons';
 import { translations } from '../utils/translations';
+import { sendPurchaseEmail } from '../services/emailService';
 
 interface PlanConfig {
   id: string;
   name: string;
   price: number;
+  features?: string[];
 }
 
 export const SubscriptionModal = () => {
   const { isSubscriptionModalOpen, setIsSubscriptionModalOpen, user, upgradeToPro, language } = useAppContext();
   const [plans, setPlans] = useState<PlanConfig[]>([
-    { id: 'basic', name: 'Basic Plan', price: 699 },
-    { id: 'pro', name: 'Pro Plan', price: 1299 },
-    { id: 'annual', name: 'Annual Plan', price: 4999 }
+    { id: 'basic', name: 'Basic Plan', price: 699, features: ['Unlimited chat analysis', 'Standard document export'] },
+    { id: 'pro', name: 'Pro Plan', price: 1299, features: ['Unlimited chat analysis', 'Priority AI processing', 'Advanced DOCX/PDF export'] },
+    { id: 'annual', name: 'Annual Plan', price: 4999, features: ['All Pro features', '24/7 VIP Support', 'Custom templates access'] }
   ]);
-  const [selectedPlanId, setSelectedPlanId] = useState<string>('pro');
+  const [selectedPlanId, setSelectedPlanId] = useState<string>('basic');
 
   useEffect(() => {
-    const savedPlans = localStorage.getItem('legalai_subscription_plans');
+    const savedPlans = localStorage.getItem('casemate_subscription_plans');
     if (savedPlans) {
       try {
-        setPlans(JSON.parse(savedPlans));
+        const parsed = JSON.parse(savedPlans);
+        if (parsed.length > 0) {
+          setPlans(parsed);
+          setSelectedPlanId(parsed[0].id); // Default to first available plan
+        }
       } catch (e) {
         console.error("Error loading plans in modal", e);
       }
@@ -32,12 +38,15 @@ export const SubscriptionModal = () => {
   if (!isSubscriptionModalOpen) return null;
 
   const t = translations[language] || translations['English'];
-  const activePlan = plans.find(p => p.id === selectedPlanId) || plans[1];
+  const activePlan = plans.find(p => p.id === selectedPlanId) || plans[0];
 
-  const handlePayment = () => {
-    // Fetch Razorpay Key dynamically from Admin Panel settings
-    let rzpKey = "rzp_test_123456789"; // Default fallback
-    const savedKeys = localStorage.getItem('legalai_api_keys');
+  const handlePayment = async () => {
+    if (user?.email) {
+      await sendPurchaseEmail(user.email, user.name || 'Advocate', activePlan.name);
+    }
+
+    let rzpKey = "rzp_test_123456789";
+    const savedKeys = localStorage.getItem('casemate_api_keys');
     if (savedKeys) {
       try {
         const parsed = JSON.parse(savedKeys);
@@ -55,7 +64,7 @@ export const SubscriptionModal = () => {
       key: rzpKey,
       amount: amountInPaise.toString(),
       currency: "INR",
-      name: "LegalAI Assistant",
+      name: "casemate Assistant",
       description: `${activePlan.name} Subscription`,
       handler: function (response: any) {
         upgradeToPro();
@@ -117,7 +126,7 @@ export const SubscriptionModal = () => {
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
             {plans.map((p) => (
               <button
-                key={p.id}
+                key={p.id || p.name}
                 onClick={() => setSelectedPlanId(p.id)}
                 className={`p-4 rounded-2xl border text-left transition-all flex flex-col justify-between ${
                   selectedPlanId === p.id 
@@ -143,9 +152,19 @@ export const SubscriptionModal = () => {
             <span className="text-xl font-extrabold text-yellow-400">₹{activePlan.price}</span>
           </div>
           <ul className="space-y-2 text-sm text-slate-300 font-medium">
-            <li className="flex items-center gap-2.5"><CheckIcon className="w-4 h-4 text-green-500 flex-shrink-0"/> {t.feature1}</li>
-            <li className="flex items-center gap-2.5"><CheckIcon className="w-4 h-4 text-green-500 flex-shrink-0"/> {t.feature2}</li>
-            <li className="flex items-center gap-2.5"><CheckIcon className="w-4 h-4 text-green-500 flex-shrink-0"/> {t.feature3}</li>
+            {activePlan.features && activePlan.features.length > 0 ? (
+              activePlan.features.map((feat, idx) => (
+                <li key={idx} className="flex items-center gap-2.5">
+                  <CheckIcon className="w-4 h-4 text-green-500 flex-shrink-0"/> {feat}
+                </li>
+              ))
+            ) : (
+              <>
+                <li className="flex items-center gap-2.5"><CheckIcon className="w-4 h-4 text-green-500 flex-shrink-0"/> {t.feature1}</li>
+                <li className="flex items-center gap-2.5"><CheckIcon className="w-4 h-4 text-green-500 flex-shrink-0"/> {t.feature2}</li>
+                <li className="flex items-center gap-2.5"><CheckIcon className="w-4 h-4 text-green-500 flex-shrink-0"/> {t.feature3}</li>
+              </>
+            )}
           </ul>
         </div>
         
@@ -154,7 +173,7 @@ export const SubscriptionModal = () => {
             onClick={handlePayment}
             className="w-full bg-gradient-to-r from-blue-600 to-blue-700 text-white py-3.5 rounded-xl font-bold text-base hover:from-blue-700 hover:to-blue-800 transition-all shadow-lg hover:shadow-xl transform hover:-translate-y-0.5"
           >
-            {t.payWithRazorpay} (₹{activePlan.price})
+            रेज़रपे के साथ ₹{activePlan.price} का भुगतान करें (₹{activePlan.price})
           </button>
         )}
       </div>

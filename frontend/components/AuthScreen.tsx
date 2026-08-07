@@ -2,6 +2,14 @@ import React, { useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { ScaleIcon, XIcon } from './Icons';
 import { translations } from '../utils/translations';
+import { auth } from '../services/firebaseService';
+import { sendWelcomeEmail } from '../services/emailService';
+import { 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  sendEmailVerification,
+  signOut 
+} from 'firebase/auth';
 
 export const AuthScreen = () => {
   const { setUser, language, setLanguage } = useAppContext();
@@ -14,13 +22,13 @@ export const AuthScreen = () => {
 
   const t = translations[language] || translations['English'];
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    
+     
     // Dynamic Admin Bypass
-    const adminCreds = JSON.parse(localStorage.getItem('legalai_admin_creds') || '{"email":"admin@legalai.com","password":"admin123"}');
-    
+    const adminCreds = JSON.parse(localStorage.getItem('casemate_admin_creds') || '{"email":"admin@casemate.com","password":"admin123"}');
+     
     if (isLogin && email === adminCreds.email && password === adminCreds.password) {
       setUser({
         id: 'admin-001',
@@ -32,36 +40,44 @@ export const AuthScreen = () => {
       return;
     }
 
-    const usersDb = JSON.parse(localStorage.getItem('legalai_users_db') || '[]');
+    try {
+      if (isLogin) {
+        const userCredential = await signInWithEmailAndPassword(auth, email, password);
+        const firebaseUser = userCredential.user;
 
-    if (isLogin) {
-      const foundUser = usersDb.find((u: any) => u.email === email && u.password === password);
-      if (foundUser) {
-        // Omit password from context user object
-        const { password: _, ...userWithoutPassword } = foundUser;
-        setUser(userWithoutPassword);
-      } else {
-        setError(t.invalidCreds);
-      }
-    } else {
-      const exists = usersDb.find((u: any) => u.email === email);
-      if (exists) {
-        setError(t.emailInUse);
-      } else {
-        const newUser = {
-          id: Date.now().toString(),
-          name: name || 'New Advocate',
-          email: email,
-          password: password,
+        // Email Verification Check
+        if (!firebaseUser.emailVerified) {
+          await signOut(auth); // Bina verify ke andar jane se rok do
+          setError('Aapne apna email verify nahi kiya hai! Please apna inbox/spam check karein aur link par click karke verify karein.');
+          return;
+        }
+
+        setUser({
+          id: firebaseUser.uid,
+          name: firebaseUser.displayName || 'Advocate',
+          email: firebaseUser.email || email,
           plan: 'free',
           role: 'user'
-        };
-        usersDb.push(newUser);
-        localStorage.setItem('legalai_users_db', JSON.stringify(usersDb));
+        });
+      } else {
+        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        const firebaseUser = userCredential.user;
+
+        await sendEmailVerification(firebaseUser);
         
-        const { password: _, ...userWithoutPassword } = newUser;
-        setUser(userWithoutPassword);
+        // EmailJS Welcome Email Triggered Here
+        await sendWelcomeEmail(email, name || 'Advocate');
+
+        await signOut(auth); // Account banne ke baad turant logout kar do
+
+        alert(`Verification email sent to ${email}!\nPlease check your inbox and verify your email before logging in.`);
+         
+        setIsLogin(true);
+        setError('Verification email sent. Please verify and log in.');
       }
+    } catch (err: any) {
+      console.error("Auth error:", err);
+      setError(err.message || t.invalidCreds || 'Authentication failed');
     }
   };
 
@@ -90,7 +106,7 @@ export const AuthScreen = () => {
             {t.appSubtitle}
           </p>
         </div>
-        
+         
         {error && (
           <div className="bg-red-900/50 border border-red-500/50 text-red-200 px-4 py-3 rounded-lg text-sm text-center">
             {error}
@@ -145,7 +161,7 @@ export const AuthScreen = () => {
             </button>
           </div>
         </form>
-        
+         
         <div className="text-center mt-4">
           <button
             onClick={() => { setIsLogin(!isLogin); setError(''); }}
@@ -154,7 +170,7 @@ export const AuthScreen = () => {
             {isLogin ? t.noAccount : t.hasAccount}
           </button>
         </div>
-        
+         
         <div className="text-center mt-6 pt-4 border-t border-slate-800">
           <button 
             onClick={() => setShowPrivacy(true)} 
@@ -165,7 +181,6 @@ export const AuthScreen = () => {
         </div>
       </div>
 
-      {/* Privacy Policy Modal */}
       {showPrivacy && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center z-[100] backdrop-blur-sm p-4">
           <div className="bg-slate-900 p-8 rounded-3xl max-w-md w-full shadow-2xl relative border border-slate-800">

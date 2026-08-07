@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { PlusIcon, SettingsIcon, ScaleIcon, LogoutIcon, SparklesIcon } from './Icons';
+import { PlusIcon, SettingsIcon, ScaleIcon, LogoutIcon, SparklesIcon, SearchIcon, TrashIcon, EditIcon, CheckIcon, XIcon } from './Icons';
 import { translations } from '../utils/translations';
 
 interface PlanConfig {
@@ -16,6 +16,8 @@ export const Sidebar = () => {
     activeSessionId, 
     setActiveSessionId, 
     createNewSession,
+    deleteChatSession,
+    renameChatSession,
     usageSeconds,
     setIsSettingsOpen,
     setIsSubscriptionModalOpen,
@@ -30,10 +32,13 @@ export const Sidebar = () => {
     { id: 'pro', name: 'Pro Plan', price: 1299 },
     { id: 'annual', name: 'Annual Plan', price: 4999 }
   ]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [newTitle, setNewTitle] = useState('');
 
   // Load dynamic plans set from Admin Panel
   useEffect(() => {
-    const savedPlans = localStorage.getItem('legalai_subscription_plans');
+    const savedPlans = localStorage.getItem('casemate_subscription_plans');
     if (savedPlans) {
       try {
         setPlans(JSON.parse(savedPlans));
@@ -49,15 +54,34 @@ export const Sidebar = () => {
     return `${m}m ${s}s`;
   };
 
+  // Filter sessions based on search query
+  const filteredSessions = chatSessions.filter(session => 
+    session.title.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  const handleStartRename = (e: React.MouseEvent, session: { id: string, title: string }) => {
+    e.stopPropagation();
+    setEditingSessionId(session.id);
+    setNewTitle(session.title);
+  };
+
+  const handleSaveRename = (e: React.MouseEvent, sessionId: string) => {
+    e.stopPropagation();
+    if (newTitle.trim() && renameChatSession) {
+      renameChatSession(sessionId, newTitle.trim());
+    }
+    setEditingSessionId(null);
+  };
+
   return (
     <div className={`${isSidebarOpen ? 'w-64' : 'w-0'} bg-slate-900 text-slate-300 flex flex-col h-full border-r border-slate-800 flex-shrink-0 transition-all duration-300 overflow-hidden`}>
       <div className="w-64 flex flex-col h-full">
         <div className="p-4 flex items-center gap-3 text-white font-bold text-lg border-b border-slate-800">
           <ScaleIcon className="w-6 h-6 text-blue-400" />
-          LegalAI
+          casemate
         </div>
 
-        <div className="p-4">
+        <div className="p-4 pb-2">
           <button 
             onClick={createNewSession} 
             className="w-full flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-white py-2.5 px-4 rounded-lg transition-colors font-medium text-sm border border-slate-700"
@@ -66,24 +90,97 @@ export const Sidebar = () => {
             {t.newChat}
           </button>
         </div>
+
+        {/* Search Bar for Chat History */}
+        <div className="px-4 pb-2">
+          <div className="relative">
+            <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
+              <SearchIcon className="w-3.5 h-3.5" />
+            </span>
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search chats..."
+              className="w-full bg-slate-800/60 border border-slate-700/80 text-white text-xs rounded-lg pl-8 pr-3 py-2 outline-none focus:border-blue-500 transition-colors placeholder-slate-500"
+            />
+          </div>
+        </div>
         
         <div className="flex-1 overflow-y-auto px-3 space-y-1 custom-scrollbar">
-          <div className="text-xs font-semibold text-slate-500 mb-3 px-2 uppercase tracking-wider mt-2">{t.recentCases}</div>
-          {chatSessions.length === 0 ? (
-            <div className="text-sm text-slate-500 px-2 italic">{t.noRecentCases}</div>
+          <div className="text-xs font-semibold text-slate-500 mb-2 px-2 uppercase tracking-wider mt-1">{t.recentCases}</div>
+          {filteredSessions.length === 0 ? (
+            <div className="text-sm text-slate-500 px-2 italic">
+              {chatSessions.length === 0 ? t.noRecentCases : "No matching chats found"}
+            </div>
           ) : (
-            chatSessions.map(session => (
-              <button 
+            filteredSessions.map(session => (
+              <div 
                 key={session.id}
                 onClick={() => setActiveSessionId(session.id)}
-                className={`w-full text-left px-3 py-2.5 rounded-lg truncate text-sm transition-colors ${
+                className={`group flex items-center justify-between w-full px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer ${
                   activeSessionId === session.id 
                     ? 'bg-slate-800 text-white font-medium' 
                     : 'hover:bg-slate-800/50 text-slate-400'
                 }`}
               >
-                {session.title}
-              </button>
+                {editingSessionId === session.id ? (
+                  <div className="flex items-center gap-1 flex-1 pr-1" onClick={(e) => e.stopPropagation()}>
+                    <input
+                      type="text"
+                      value={newTitle}
+                      onChange={(e) => setNewTitle(e.target.value)}
+                      className="w-full bg-slate-900 border border-blue-500 text-white text-xs rounded px-2 py-1 outline-none"
+                      autoFocus
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          if (newTitle.trim() && renameChatSession) renameChatSession(session.id, newTitle.trim());
+                          setEditingSessionId(null);
+                        } else if (e.key === 'Escape') {
+                          setEditingSessionId(null);
+                        }
+                      }}
+                    />
+                    <button 
+                      onClick={(e) => handleSaveRename(e, session.id)} 
+                      className="text-green-400 hover:text-green-300 p-1"
+                      title="Save"
+                    >
+                      <CheckIcon className="w-3.5 h-3.5" />
+                    </button>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); setEditingSessionId(null); }} 
+                      className="text-slate-400 hover:text-slate-200 p-1"
+                      title="Cancel"
+                    >
+                      <XIcon className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <span className="truncate flex-1 pr-2">{session.title}</span>
+                    <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity">
+                      <button 
+                        onClick={(e) => handleStartRename(e, session)}
+                        className="text-slate-400 hover:text-white p-1 rounded transition-colors"
+                        title="Rename Chat"
+                      >
+                        <EditIcon className="w-3.5 h-3.5" />
+                      </button>
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (deleteChatSession) deleteChatSession(session.id);
+                        }}
+                        className="text-slate-400 hover:text-red-400 p-1 rounded transition-colors"
+                        title="Delete Chat"
+                      >
+                        <TrashIcon className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
             ))
           )}
         </div>
