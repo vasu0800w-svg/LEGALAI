@@ -2,8 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { XIcon } from './Icons';
 import { sendPurchaseEmail } from '../services/emailService';
-import { db } from '../services/firebaseService';
-import { doc, updateDoc } from 'firebase/firestore';
+import { startRazorpayCheckout } from '../services/razorpayCheckout';
 
 interface PlanConfig {
   id: string;
@@ -15,9 +14,6 @@ export const MockRazorpay = () => {
   const { isMockRazorpayOpen, setIsMockRazorpayOpen, upgradeToPro, user } = useAppContext();
   const [isProcessing, setIsProcessing] = useState(false);
   const [activePlan, setActivePlan] = useState<PlanConfig>({ id: 'pro', name: 'Pro Plan', price: 1299 });
-  
-  // .env file se direct Razorpay Key ID utha rahe hain
-  const razorpayKeyId = (import.meta as any).env.VITE_RAZORPAY_KEY_ID || '';
 
   useEffect(() => {
     if (isMockRazorpayOpen) {
@@ -38,77 +34,31 @@ export const MockRazorpay = () => {
   if (!isMockRazorpayOpen) return null;
 
   const handleLivePayment = async () => {
-    if (!razorpayKeyId) {
-      alert("Razorpay Key ID is missing! Please configure it in the .env file.");
-      return;
-    }
-
     setIsProcessing(true);
-
-    const res = await loadRazorpayScript('https://checkout.razorpay.com/v1/checkout.js');
-    if (!res) {
-      alert("Razorpay SDK failed to load. Check your internet connection.");
-      setIsProcessing(false);
-      return;
-    }
-
-    const options = {
-      key: razorpayKeyId,
-      amount: activePlan.price * 100,
-      currency: "INR",
-      name: "casemate Assistant",
-      description: `Subscription for ${activePlan.name}`,
-      handler: async function (response: any) {
-        try {
-          if (user?.id) {
-            const userRef = doc(db, 'users_db', user.id);
-            await updateDoc(userRef, { plan: activePlan.id });
-          }
-
+    try {
+      await startRazorpayCheckout({
+        amountRupees: activePlan.price,
+        description: `Subscription for ${activePlan.name}`,
+        prefill: {
+          name: user?.name || 'Advocate',
+          email: user?.email || '',
+          contact: (user as any)?.phone || '',
+        },
+        onVerified: async () => {
           if (user?.email) {
             await sendPurchaseEmail(user.email, user.name || 'Advocate', activePlan.name);
           }
-
-          upgradeToPro();
-          setIsProcessing(false);
+          upgradeToPro(activePlan.id);
           setIsMockRazorpayOpen(false);
-          alert("Payment Successful! Your Pro plan is now active.");
-        } catch (err) {
-          console.error("Error updating plan after payment:", err);
-          setIsProcessing(false);
-        }
-      },
-      prefill: {
-        name: user?.name || "Advocate",
-        email: user?.email || "user@example.com",
-        contact: (user as any)?.phone || "9999999999"
-      },
-      theme: {
-        color: "#02042b"
-      }
-    };
-
-    try {
-      const paymentObject = new (window as any).Razorpay(options);
-      paymentObject.open();
-      paymentObject.on('payment.failed', function (response: any) {
-        alert(`Payment failed: ${response.error.description}`);
-        setIsProcessing(false);
+          alert('Payment Successful! Your plan is now active.');
+        },
       });
-    } catch (e) {
-      console.error("Razorpay open error:", e);
+    } catch (e: any) {
+      console.error('Razorpay open error:', e);
+      alert(e?.message || 'Unable to start payment.');
+    } finally {
       setIsProcessing(false);
     }
-  };
-
-  const loadRazorpayScript = (src: string) => {
-    return new Promise((resolve) => {
-      const script = document.createElement('script');
-      script.src = src;
-      script.onload = () => resolve(true);
-      script.onerror = () => resolve(false);
-      document.body.appendChild(script);
-    });
   };
 
   return (
