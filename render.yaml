@@ -1,0 +1,19 @@
+# Render Blueprint — deploy casemate backend (Razorpay + health)
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: casemate-api
+    runtime: node
+    plan: free
+    region: singapore
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false

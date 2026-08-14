@@ -10,26 +10,42 @@ import { GoogleAuth } from 'google-auth-library';
 import fetch from 'node-fetch';
 import rateLimit from 'express-rate-limit';
 import { WebSocketServer, WebSocket } from 'ws';
+import { validateChatLimitsMiddleware, getPlanLimits } from './middleware/planLimits.js';
+import { createOrderHandler, verifyPaymentHandler, razorpayOptionsHandler } from './routes/razorpay.js';
 
 const app = express();
 app.use(express.json({limit: process?.env?.API_PAYLOAD_MAX_SIZE || "7mb"}));
 
-const PORT = process?.env?.API_BACKEND_PORT || 5000;
-const API_BACKEND_HOST = process?.env?.API_BACKEND_HOST || "127.0.0.1";
+// Render sets PORT; bind 0.0.0.0 so the service is reachable publicly
+const PORT = Number(process?.env?.PORT || process?.env?.API_BACKEND_PORT || 5000);
+const API_BACKEND_HOST = process?.env?.API_BACKEND_HOST || "0.0.0.0";
 
 const GOOGLE_CLOUD_LOCATION = process?.env?.GOOGLE_CLOUD_LOCATION;
 const GOOGLE_CLOUD_PROJECT = process?.env?.GOOGLE_CLOUD_PROJECT;
-if (!GOOGLE_CLOUD_PROJECT || !GOOGLE_CLOUD_LOCATION) {
-  console.error("Error: Environment variables GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION must be set.");
-  process.exit(1);
-}
 const PROXY_HEADER = process?.env?.PROXY_HEADER;
-if (!PROXY_HEADER) {
-  console.error("Error: Environment variables PROXY_HEADER must be set.");
-  process.exit(1);
+const vertexEnabled = Boolean(GOOGLE_CLOUD_PROJECT && GOOGLE_CLOUD_LOCATION && PROXY_HEADER);
+
+if (!vertexEnabled) {
+  console.warn(
+    "[casemate-api] Google Vertex proxy env vars missing — /api-proxy disabled. Razorpay + health routes still work."
+  );
 }
 
 app.set('trust proxy', 1 /* number of proxies between user and server */);
+
+// Health check for Render
+app.get('/', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: 'casemate-api',
+    razorpay: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
+    vertexProxy: vertexEnabled,
+  });
+});
+
+app.get('/health', (_req, res) => {
+  res.status(200).json({ ok: true });
+});
 
 // IMPORTANT: Vertex AI Studio Rate Limiting
 // This rate limiting configuration protects your backend APIs from abuse.
@@ -45,7 +61,34 @@ const proxyLimiter = rateLimit({
     },
 });
 // Apply the rate limiter to the /api-proxy route before the main proxy logic
-app.use('/api-proxy', proxyLimiter);
+if (vertexEnabled) {
+  app.use('/api-proxy', proxyLimiter);
+}
+
+// Validate plan-wise message / session character limits
+app.post('/api/validate-chat-limits', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  validateChatLimitsMiddleware(req, res, () => {
+    res.status(200).json({
+      ok: true,
+      limits: req.planLimits || getPlanLimits(req.body?.plan),
+    });
+  });
+});
+
+app.options('/api/validate-chat-limits', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+
+// Razorpay Standard Checkout
+app.options('/api/create-order', razorpayOptionsHandler);
+app.options('/api/verify-payment', razorpayOptionsHandler);
+app.post('/api/create-order', createOrderHandler);
+app.post('/api/verify-payment', verifyPaymentHandler);
 
 const API_CLIENT_MAP = [
  {
@@ -114,11 +157,12 @@ const ALLOWED_UPSTREAM_HOSTS = new Set([
   "aiplatform.clients6.google.com",
 ]);
 
-// Uses Google Application Default Credentials (ADC).
-// Users need to run "gcloud auth application-default login" in order to use the proxy.
-const auth = new GoogleAuth({
-  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-});
+// Uses Google Application Default Credentials (ADC) when Vertex proxy is enabled.
+const auth = vertexEnabled
+  ? new GoogleAuth({
+      scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+    })
+  : null;
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -184,6 +228,11 @@ function getRequestHeaders(accessToken) {
 
 // --- Proxy Endpoint ---
 app.post('/api-proxy', async (req, res) => {
+  if (!vertexEnabled || !auth) {
+    return res.status(503).json({
+      error: 'Vertex proxy is not configured on this server.',
+    });
+  }
 
   // Check for the custom header added by the shim
   if (req.headers['x-app-proxy'] !== PROXY_HEADER) {
@@ -324,7 +373,9 @@ app.post('/api-proxy', async (req, res) => {
 });
 
 const server = app.listen(PORT, API_BACKEND_HOST, () => {
-  console.log(`Vertex AI Backend listening at http://localhost:${PORT}`);
+  console.log(`casemate-api listening on http://${API_BACKEND_HOST}:${PORT}`);
+  console.log(`  Razorpay: ${process.env.RAZORPAY_KEY_ID ? 'configured' : 'NOT configured'}`);
+  console.log(`  Vertex proxy: ${vertexEnabled ? 'enabled' : 'disabled'}`);
 });
 
 
