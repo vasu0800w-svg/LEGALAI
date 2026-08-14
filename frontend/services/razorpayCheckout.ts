@@ -59,6 +59,8 @@ export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
     throw new Error('Razorpay Checkout failed to load. Check your internet connection.');
   }
 
+  const isTestKey = String(keyId).startsWith('rzp_test_');
+
   const options = {
     key: keyId,
     amount: orderData.amount,
@@ -71,6 +73,17 @@ export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
       email: args.prefill?.email || '',
       contact: args.prefill?.contact || '',
     },
+    // Test mode: real UPI IDs fail with "Invalid UPI" — prefer card for testing
+    ...(isTestKey
+      ? {
+          method: {
+            netbanking: true,
+            card: true,
+            upi: false,
+            wallet: true,
+          },
+        }
+      : {}),
     theme: { color: '#2563eb' },
     modal: {
       ondismiss: () => {
