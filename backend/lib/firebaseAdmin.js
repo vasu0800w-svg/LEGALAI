@@ -13,6 +13,14 @@
  */
 import { initializeApp, cert, applicationDefault, getApps } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
+import { getAuth } from 'firebase-admin/auth';
+
+export const projectId = () =>
+  String(
+    process.env.FIREBASE_PROJECT_ID ||
+    process.env.VITE_FIREBASE_PROJECT_ID ||
+    'legalai-78759'
+  ).trim();
 
 /** Their Firestore database is not "(default)" — it is named "legal". */
 const DATABASE_ID = String(
@@ -22,6 +30,7 @@ const DATABASE_ID = String(
 ).trim();
 
 let db = null;
+let app = null;
 let initError = '';
 
 const parseServiceAccount = (raw) => {
@@ -36,20 +45,21 @@ const parseServiceAccount = (raw) => {
 const init = () => {
   try {
     const existing = getApps();
-    const app = existing.length
-      ? existing[0]
-      : (() => {
-          const svc = parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT);
-          if (svc) return initializeApp({ credential: cert(svc) });
-          if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-            return initializeApp({ credential: applicationDefault() });
-          }
-          return null;
-        })();
-
-    if (!app) {
-      initError = 'FIREBASE_SERVICE_ACCOUNT is not set';
-      return;
+    if (existing.length) {
+      app = existing[0];
+    } else {
+      const svc = parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT);
+      if (svc) {
+        app = initializeApp({ credential: cert(svc), projectId: svc.project_id || projectId() });
+      } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+        app = initializeApp({ credential: applicationDefault(), projectId: projectId() });
+      } else {
+        // No credentials: token verification still works (it only needs the
+        // project id plus Google's public certs). Firestore writes do not.
+        initError = 'FIREBASE_SERVICE_ACCOUNT is not set';
+        app = initializeApp({ projectId: projectId() });
+        return;
+      }
     }
     db = getFirestore(app, DATABASE_ID);
   } catch (err) {
@@ -64,14 +74,24 @@ if (db) {
   console.log(`[firebase-admin] ready (database: ${DATABASE_ID})`);
 } else {
   console.warn(
-    `[firebase-admin] NOT configured (${initError}). ` +
-    'Subscriptions are disabled and per-user AI fair-use is not enforced. ' +
+    `[firebase-admin] no credentials (${initError}). ` +
+    'Sign-in verification still works; subscriptions and per-user AI fair-use are disabled. ' +
     'Set FIREBASE_SERVICE_ACCOUNT on the server to enable both.'
   );
 }
 
+/** True when Firestore writes are possible (service account present). */
 export const adminReady = () => db !== null;
 export const adminInitError = () => initError;
 export const getDb = () => db;
 export const userDoc = (uid) => db.collection('users_data').doc(uid);
 export const orderDoc = (orderId) => db.collection('orders').doc(orderId);
+
+/**
+ * Verify a Firebase ID token. Works without a service account because it only
+ * needs the project id and Google's public securetoken certificates.
+ */
+export const verifyFirebaseIdToken = async (idToken) => {
+  if (!app) throw new Error('Firebase Admin app not initialised');
+  return getAuth(app).verifyIdToken(idToken);
+};

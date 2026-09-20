@@ -5,13 +5,11 @@
  * token, and per-account fair use / device slots are enforced in usageGuard.
  * Concurrent users are not queued — each request hits Google in parallel.
  */
+import { GoogleGenAI } from '@google/genai';
 import { verifyRequestUser } from '../lib/authUser.js';
 import { reserveAiRequest } from '../lib/usageGuard.js';
 
 const DEFAULT_MODEL = 'gemini-3.8-flash';
-
-const GEMINI_URL = (model) =>
-  `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 
 const cors = (res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -24,20 +22,48 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const getApiKey = () =>
   String(process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || '').trim();
 
-const isRetryableStatus = (status) =>
-  status === 429 || status === 500 || status === 503;
+/**
+ * The official SDK, so the server works with either key format Google issues
+ * (AI Studio "AIza..." keys and Vertex express "AQ..." keys).
+ */
+let client = null;
+const getClient = () => {
+  const apiKey = getApiKey();
+  if (!apiKey) return null;
+  if (!client) client = new GoogleGenAI({ apiKey });
+  return client;
+};
 
-const toRestParts = (item) => {
+const errStatus = (err) =>
+  Number(err?.status || err?.code || err?.response?.status || 0);
+
+const isRetryableError = (err) => {
+  const status = errStatus(err);
+  if (status === 429 || status === 500 || status === 503) return true;
+  return /overloaded|unavailable|timeout|deadline|ECONNRESET|fetch failed/i.test(
+    String(err?.message || '')
+  );
+};
+
+/** Normalise whatever the client sent into SDK parts. */
+const toSdkParts = (item) => {
   if (!item || typeof item !== 'object') return { text: String(item || '') };
   if (item.inlineData?.data) {
     return {
-      inline_data: {
-        mime_type: item.inlineData.mimeType || 'image/jpeg',
+      inlineData: {
+        mimeType: item.inlineData.mimeType || 'image/jpeg',
         data: item.inlineData.data,
       },
     };
   }
-  if (item.inline_data?.data) return item;
+  if (item.inline_data?.data) {
+    return {
+      inlineData: {
+        mimeType: item.inline_data.mime_type || 'image/jpeg',
+        data: item.inline_data.data,
+      },
+    };
+  }
   return { text: item.text || '' };
 };
 
@@ -57,35 +83,35 @@ const budgetToLevel = (budget) => {
 
 const usesThinkingLevel = (model) => /gemini-3\.(7|8|9)|gemini-[4-9]/.test(String(model));
 
-const toRestBody = (contents, config, model) => {
+const toSdkContents = (contents) => {
   const list = Array.isArray(contents) ? contents : [contents];
-  const alreadyRest = list.length > 0 && Array.isArray(list[0]?.parts);
-  const restContents = alreadyRest
-    ? list
-    : [{ role: 'user', parts: list.map(toRestParts) }];
-
-  const body = { contents: restContents };
-  const instruction = config?.systemInstruction;
-  if (instruction) {
-    body.system_instruction = {
-      parts: [{ text: typeof instruction === 'string' ? instruction : instruction.text || '' }],
-    };
-  }
-  if (typeof config?.temperature === 'number') {
-    body.generationConfig = { ...(body.generationConfig || {}), temperature: config.temperature };
-  }
-  const think = config?.thinkingConfig;
-  if (think && typeof think === 'object') {
-    const thinkingConfig = usesThinkingLevel(model)
-      ? { thinkingLevel: think.thinkingLevel || budgetToLevel(think.thinkingBudget) }
-      : think;
-    body.generationConfig = { ...(body.generationConfig || {}), thinkingConfig };
-  }
-  return body;
+  if (list.length > 0 && Array.isArray(list[0]?.parts)) return list;
+  return [{ role: 'user', parts: list.map(toSdkParts) }];
 };
 
-const extractText = (data) => {
-  const parts = data?.candidates?.[0]?.content?.parts;
+const toSdkConfig = (config, model) => {
+  const out = {};
+  const instruction = config?.systemInstruction;
+  if (instruction) {
+    out.systemInstruction = typeof instruction === 'string'
+      ? instruction
+      : instruction.text || '';
+  }
+  if (typeof config?.temperature === 'number') out.temperature = config.temperature;
+
+  const think = config?.thinkingConfig;
+  if (think && typeof think === 'object') {
+    out.thinkingConfig = usesThinkingLevel(model)
+      ? { thinkingLevel: think.thinkingLevel || budgetToLevel(think.thinkingBudget) }
+      : think;
+  }
+  out.httpOptions = { timeout: 90000 };
+  return out;
+};
+
+const extractText = (response) => {
+  if (typeof response?.text === 'string') return response.text;
+  const parts = response?.candidates?.[0]?.content?.parts;
   if (!Array.isArray(parts)) return '';
   return parts.map((p) => p.text || '').join('');
 };
@@ -107,8 +133,8 @@ export async function geminiHandler(req, res) {
     });
   }
 
-  const apiKey = getApiKey();
-  if (!apiKey) {
+  const ai = getClient();
+  if (!ai) {
     return res.status(503).json({
       error: 'GEMINI_NOT_CONFIGURED',
       message: 'Gemini API key is not configured on the server.',
@@ -137,42 +163,30 @@ export async function geminiHandler(req, res) {
     }
   }
 
-  const payload = toRestBody(contents, req.body?.config, model);
-  let lastStatus = 500;
-  let lastBody = '';
+  const request = {
+    model,
+    contents: toSdkContents(contents),
+    config: toSdkConfig(req.body?.config, model),
+  };
+
+  let lastStatus = 502;
+  let lastMessage = 'Gemini request failed';
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const upstream = await fetch(`${GEMINI_URL(model)}?key=${encodeURIComponent(apiKey)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(90000),
-      });
-      lastStatus = upstream.status;
-      lastBody = await upstream.text();
-
-      if (upstream.ok) {
-        let data = {};
-        try {
-          data = JSON.parse(lastBody);
-        } catch {
-          return res.status(502).json({ error: 'BAD_UPSTREAM', message: 'Gemini returned invalid JSON.' });
-        }
-        return res.status(200).json({ text: extractText(data) });
-      }
-
-      if (!isRetryableStatus(upstream.status) || attempt === 1) break;
-      await sleep(500 * (attempt + 1));
+      const response = await ai.models.generateContent(request);
+      return res.status(200).json({ text: extractText(response) });
     } catch (err) {
-      lastBody = err?.name === 'TimeoutError' ? 'Gemini request timed out' : (err?.message || 'Network error');
-      if (attempt === 1) break;
+      lastStatus = errStatus(err) || 502;
+      lastMessage = String(err?.message || 'Gemini request failed');
+      if (!isRetryableError(err) || attempt === 1) break;
       await sleep(500 * (attempt + 1));
     }
   }
 
+  console.error('[gemini] upstream failed:', lastStatus, lastMessage.slice(0, 300));
   return res.status(lastStatus >= 400 ? lastStatus : 502).json({
     error: 'GEMINI_FAILED',
-    message: lastBody.slice(0, 180),
+    message: lastMessage.slice(0, 180),
   });
 }
