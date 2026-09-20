@@ -1,15 +1,25 @@
 /**
- * Razorpay Standard Checkout — create order + verify signature.
- * KEY_SECRET stays server-side only.
+ * Razorpay Standard Checkout — create order + verify signature + grant the plan.
+ *
+ * The phone never decides what it paid for or what it gets:
+ *  - /api/create-order  takes a planId, prices it from server config, and stores
+ *    a pending order tied to the signed-in user.
+ *  - /api/verify-payment checks the signature against that stored order and then
+ *    writes the plan with the Admin SDK (Firestore rules block the client).
  */
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
+import { adminReady, adminInitError, getDb, userDoc, orderDoc } from '../lib/firebaseAdmin.js';
+import { verifyRequestUser } from '../lib/authUser.js';
+import { DEFAULT_PLAN_PRICES, PLAN_DURATION_DAYS } from '../middleware/planLimits.js';
 
 const cors = (res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 };
+
+const VALID_PLANS = ['basic', 'pro', 'annual'];
 
 function getRazorpayClient() {
   const key_id = process.env.RAZORPAY_KEY_ID;
@@ -22,32 +32,84 @@ function getRazorpayClient() {
   return new Razorpay({ key_id, key_secret });
 }
 
-/** POST /api/create-order  body: { amount (paise), currency?, receipt? } */
+/** Live price from the admin panel, falling back to the built-in default. */
+const resolvePlanPrice = async (planId) => {
+  const fallback = DEFAULT_PLAN_PRICES[planId];
+  if (!adminReady()) return fallback;
+  try {
+    const snap = await getDb().collection('app_config').doc('plans').get();
+    if (!snap.exists) return fallback;
+    const raw = snap.data();
+    const list = Array.isArray(raw?.plans) ? raw.plans : Array.isArray(raw) ? raw : [];
+    const hit = list.find((p) => String(p?.id) === planId);
+    const price = Number(hit?.price);
+    return Number.isFinite(price) && price > 0 ? Math.round(price) : fallback;
+  } catch (err) {
+    console.warn('[Razorpay] could not read app_config/plans:', err?.message || err);
+    return fallback;
+  }
+};
+
+/** POST /api/create-order  body: { planId }  header: Bearer <Firebase ID token> */
 export async function createOrderHandler(req, res) {
   cors(res);
   try {
-    const amount = Number(req.body?.amount);
-    const currency = (req.body?.currency || 'INR').toUpperCase();
-    const receipt = (req.body?.receipt || `rcpt_${Date.now()}`).toString().slice(0, 40);
+    if (!adminReady()) {
+      return res.status(503).json({
+        error: 'SUBSCRIPTIONS_UNAVAILABLE',
+        message: 'Subscriptions are temporarily unavailable. Please try again later.',
+        detail: adminInitError(),
+      });
+    }
 
-    if (!Number.isFinite(amount) || amount < 100) {
+    const authUser = await verifyRequestUser(req);
+    if (!authUser) {
+      return res.status(401).json({
+        error: 'UNAUTHENTICATED',
+        message: 'Please sign in again before paying.',
+      });
+    }
+
+    const planId = String(req.body?.planId || '').trim();
+    if (!VALID_PLANS.includes(planId)) {
+      return res.status(400).json({
+        error: 'INVALID_PLAN',
+        message: 'Unknown subscription plan.',
+      });
+    }
+
+    const rupees = await resolvePlanPrice(planId);
+    const amountPaise = Math.round(rupees * 100);
+    if (!Number.isFinite(amountPaise) || amountPaise < 100) {
       return res.status(400).json({
         error: 'INVALID_AMOUNT',
-        message: 'Amount must be at least 100 paise (₹1).',
+        message: 'Plan price is not configured correctly.',
       });
     }
 
     const razorpay = getRazorpayClient();
     const order = await razorpay.orders.create({
-      amount: Math.round(amount),
-      currency,
-      receipt,
+      amount: amountPaise,
+      currency: 'INR',
+      receipt: `rcpt_${Date.now()}`.slice(0, 40),
+      notes: { uid: authUser.uid, planId },
+    });
+
+    await orderDoc(order.id).set({
+      uid: authUser.uid,
+      email: authUser.email || '',
+      planId,
+      amount: amountPaise,
+      status: 'created',
+      createdAt: Date.now(),
     });
 
     return res.status(200).json({
       order_id: order.id,
       amount: order.amount,
       currency: order.currency,
+      planId,
+      amountRupees: rupees,
     });
   } catch (err) {
     console.error('[Razorpay] create-order error:', err);
@@ -65,7 +127,11 @@ export async function createOrderHandler(req, res) {
   }
 }
 
-/** POST /api/verify-payment  body: { razorpay_order_id, razorpay_payment_id, razorpay_signature } */
+/**
+ * POST /api/verify-payment
+ * body: { razorpay_order_id, razorpay_payment_id, razorpay_signature }
+ * header: Bearer <Firebase ID token>
+ */
 export async function verifyPaymentHandler(req, res) {
   cors(res);
   try {
@@ -77,6 +143,7 @@ export async function verifyPaymentHandler(req, res) {
       return res.status(400).json({
         error: 'MISSING_FIELDS',
         message: 'razorpay_order_id, razorpay_payment_id, and razorpay_signature are required.',
+        success: false,
       });
     }
 
@@ -85,12 +152,12 @@ export async function verifyPaymentHandler(req, res) {
       return res.status(500).json({
         error: 'NOT_CONFIGURED',
         message: 'Razorpay KEY_SECRET is not configured on the server.',
+        success: false,
       });
     }
 
     const payload = `${orderId}|${paymentId}`;
     const expected = crypto.createHmac('sha256', keySecret).update(payload).digest('hex');
-
     const a = Buffer.from(expected);
     const b = Buffer.from(String(signature));
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
@@ -101,11 +168,86 @@ export async function verifyPaymentHandler(req, res) {
       });
     }
 
+    if (!adminReady()) {
+      // Signature is valid but we cannot record the plan. Say so loudly instead
+      // of letting the phone grant itself a subscription.
+      console.error('[Razorpay] payment verified but Firebase Admin is not configured — plan NOT granted:', orderId);
+      return res.status(503).json({
+        error: 'PLAN_GRANT_UNAVAILABLE',
+        message: 'Payment received but the subscription could not be activated. Please contact support with your payment id.',
+        success: false,
+        payment_id: paymentId,
+      });
+    }
+
+    const authUser = await verifyRequestUser(req);
+    if (!authUser) {
+      return res.status(401).json({
+        error: 'UNAUTHENTICATED',
+        message: 'Please sign in again so we can activate your plan.',
+        success: false,
+      });
+    }
+
+    const orderRef = orderDoc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      return res.status(400).json({
+        error: 'UNKNOWN_ORDER',
+        message: 'This order was not created by casemate.',
+        success: false,
+      });
+    }
+    const order = orderSnap.data();
+    if (order.uid !== authUser.uid) {
+      return res.status(403).json({
+        error: 'ORDER_OWNER_MISMATCH',
+        message: 'This payment belongs to a different account.',
+        success: false,
+      });
+    }
+    if (order.status === 'paid') {
+      return res.status(200).json({
+        success: true,
+        message: 'Payment already activated.',
+        planId: order.planId,
+        subscriptionExpiryDate: order.subscriptionExpiryDate || null,
+      });
+    }
+
+    const planId = VALID_PLANS.includes(order.planId) ? order.planId : 'basic';
+    const days = PLAN_DURATION_DAYS[planId] || 30;
+    const now = Date.now();
+
+    // Extend an existing subscription instead of shortening it.
+    const userSnap = await userDoc(authUser.uid).get();
+    const currentExpiry = Number(userSnap.exists ? userSnap.data()?.subscriptionExpiryDate || 0 : 0);
+    const base = currentExpiry > now ? currentExpiry : now;
+    const subscriptionExpiryDate = base + days * 24 * 60 * 60 * 1000;
+
+    await userDoc(authUser.uid).set({
+      plan: planId,
+      subscriptionExpiryDate,
+      planSource: 'razorpay',
+      planOrderId: orderId,
+      lastExpiryEmailThreshold: null,
+      updatedAt: now,
+    }, { merge: true });
+
+    await orderRef.set({
+      status: 'paid',
+      paymentId,
+      paidAt: now,
+      subscriptionExpiryDate,
+    }, { merge: true });
+
     return res.status(200).json({
       success: true,
-      message: 'Payment verified successfully.',
+      message: 'Payment verified and plan activated.',
       order_id: orderId,
       payment_id: paymentId,
+      planId,
+      subscriptionExpiryDate,
     });
   } catch (err) {
     console.error('[Razorpay] verify-payment error:', err);

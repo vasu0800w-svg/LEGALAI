@@ -12,9 +12,12 @@ import rateLimit from 'express-rate-limit';
 import { WebSocketServer, WebSocket } from 'ws';
 import { validateChatLimitsMiddleware, getPlanLimits } from './middleware/planLimits.js';
 import { createOrderHandler, verifyPaymentHandler, razorpayOptionsHandler } from './routes/razorpay.js';
+import { geminiHandler, geminiOptionsHandler } from './routes/gemini.js';
+import { attachAuthUser } from './lib/authUser.js';
+import { adminReady } from './lib/firebaseAdmin.js';
 
 const app = express();
-app.use(express.json({limit: process?.env?.API_PAYLOAD_MAX_SIZE || "7mb"}));
+app.use(express.json({limit: process?.env?.API_PAYLOAD_MAX_SIZE || "20mb"}));
 
 // Render sets PORT; bind 0.0.0.0 so the service is reachable publicly
 const PORT = Number(process?.env?.PORT || process?.env?.API_BACKEND_PORT || 5000);
@@ -39,6 +42,8 @@ app.get('/', (_req, res) => {
     ok: true,
     service: 'casemate-api',
     razorpay: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
+    gemini: Boolean(process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY),
+    firebaseAdmin: adminReady(),
     vertexProxy: vertexEnabled,
   });
 });
@@ -85,10 +90,38 @@ app.options('/api/validate-chat-limits', (_req, res) => {
 });
 
 // Razorpay Standard Checkout
+const paymentLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.authUser?.uid || req.ip || 'unknown',
+  message: {
+    error: 'RATE_LIMIT',
+    message: 'Too many payment attempts. Please wait a minute.',
+  },
+});
+
 app.options('/api/create-order', razorpayOptionsHandler);
 app.options('/api/verify-payment', razorpayOptionsHandler);
-app.post('/api/create-order', createOrderHandler);
-app.post('/api/verify-payment', verifyPaymentHandler);
+app.post('/api/create-order', attachAuthUser, paymentLimiter, createOrderHandler);
+app.post('/api/verify-payment', attachAuthUser, paymentLimiter, verifyPaymentHandler);
+// Keyed on the signed-in account, not the office IP — a shared chamber network
+// should not throttle everyone, and one account should not be able to flood.
+const geminiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 25,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.authUser?.uid || req.ip || 'unknown',
+  message: {
+    error: 'RATE_LIMIT',
+    message: 'Too many AI requests. Please wait a minute and try again.',
+  },
+});
+
+app.options('/api/gemini', geminiOptionsHandler);
+app.post('/api/gemini', attachAuthUser, geminiLimiter, geminiHandler);
 
 const API_CLIENT_MAP = [
  {
@@ -448,9 +481,6 @@ server.on('upgrade', async (request, socket, head) => {
       wss.handleUpgrade(request, socket, head, (ws) => {
 
         upstreamWs.on('message', (data, isBinary) => {
-          const logMsg = isBinary ? '<Binary Data>' : data.toString();
-          console.log(`[Upstream -> Client] [${new Date().toISOString()}]: ${logMsg}`);
-
           if (ws.readyState === WebSocket.OPEN) {
             if (data === undefined || data === null) {
               console.warn('[Node Proxy] Attempted to send undefined/null data to client');
@@ -461,14 +491,13 @@ server.on('upgrade', async (request, socket, head) => {
         });
 
         ws.on('message', (data, isBinary) => {
-          const logMsg = isBinary ? '<Binary Data>' : data.toString();
-
           let dataJson = {};
           try {
             dataJson = JSON.parse(data.toString());
           } catch (error) {
             console.error('[Node Proxy] Failed to parse message from client:', error);
             ws.close(1011, 'Failed to parse message');
+            return;
           }
 
           if (dataJson['setup']) {

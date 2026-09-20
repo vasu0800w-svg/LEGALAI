@@ -1,68 +1,246 @@
 import emailjs from '@emailjs/browser';
+import { doc, setDoc } from 'firebase/firestore';
+import { getAppConfig } from './adminConfigService';
+import { db } from './firebaseService';
 
-// .env file se direct EmailJS keys utha rahe hain
-const EMAILJS_SERVICE_ID = (import.meta as any).env.VITE_EMAILJS_SERVICE_ID || '';
-const EMAILJS_PUBLIC_KEY = (import.meta as any).env.VITE_EMAILJS_PUBLIC_KEY || '';
-const WELCOME_TEMPLATE_ID = (import.meta as any).env.VITE_EMAILJS_TEMPLATE_ID || '';
-const PURCHASE_TEMPLATE_ID = (import.meta as any).env.VITE_EMAILJS_TEMPLATE_ID || '';
-const EXPIRY_TEMPLATE_ID = (import.meta as any).env.VITE_EMAILJS_TEMPLATE_ID || '';
+type EmailKeys = {
+  serviceId: string;
+  publicKey: string;
+  welcomeTemplateId: string;
+  purchaseTemplateId: string;
+  expiryTemplateId: string;
+};
 
-// 1. Welcome Email
-export const sendWelcomeEmail = async (userEmail: string, userName: string) => {
+const envKeys = (): EmailKeys => ({
+  serviceId: String((import.meta as any).env?.VITE_EMAILJS_SERVICE_ID || ''),
+  publicKey: String((import.meta as any).env?.VITE_EMAILJS_PUBLIC_KEY || ''),
+  welcomeTemplateId: String(
+    (import.meta as any).env?.VITE_EMAILJS_WELCOME_TEMPLATE_ID ||
+      (import.meta as any).env?.VITE_EMAILJS_TEMPLATE_ID ||
+      ''
+  ),
+  purchaseTemplateId: String(
+    (import.meta as any).env?.VITE_EMAILJS_PURCHASE_TEMPLATE_ID ||
+      (import.meta as any).env?.VITE_EMAILJS_TEMPLATE_ID ||
+      ''
+  ),
+  expiryTemplateId: String(
+    (import.meta as any).env?.VITE_EMAILJS_EXPIRY_TEMPLATE_ID ||
+      (import.meta as any).env?.VITE_EMAILJS_TEMPLATE_ID ||
+      ''
+  ),
+});
+
+let cachedCloudKeys: Partial<EmailKeys> | null = null;
+
+const resolveKeys = async (): Promise<EmailKeys> => {
+  const base = envKeys();
   try {
-    if (!EMAILJS_SERVICE_ID || !EMAILJS_PUBLIC_KEY || !WELCOME_TEMPLATE_ID) {
-      console.error("EmailJS configuration missing in .env file.");
-      return;
+    if (!cachedCloudKeys) {
+      const cloud = await getAppConfig<Record<string, string>>('email_keys');
+      if (cloud) {
+        cachedCloudKeys = {
+          serviceId: cloud.serviceId || cloud.emailServiceId,
+          publicKey: cloud.publicKey || cloud.emailPublicKey,
+          welcomeTemplateId: cloud.welcomeTemplateId,
+          purchaseTemplateId: cloud.purchaseTemplateId,
+          expiryTemplateId: cloud.expiryTemplateId,
+        };
+      } else {
+        cachedCloudKeys = {};
+      }
     }
+  } catch {
+    cachedCloudKeys = cachedCloudKeys || {};
+  }
 
-    await emailjs.send(
-      EMAILJS_SERVICE_ID,
-      WELCOME_TEMPLATE_ID,
-      { to_email: userEmail, to_name: userName, message: "Welcome to casemate! Your account has been created successfully." },
-      EMAILJS_PUBLIC_KEY
-    );
-    console.log("Welcome email sent!");
+  return {
+    serviceId: cachedCloudKeys?.serviceId || base.serviceId,
+    publicKey: cachedCloudKeys?.publicKey || base.publicKey,
+    welcomeTemplateId: cachedCloudKeys?.welcomeTemplateId || base.welcomeTemplateId,
+    purchaseTemplateId: cachedCloudKeys?.purchaseTemplateId || base.purchaseTemplateId,
+    expiryTemplateId: cachedCloudKeys?.expiryTemplateId || base.expiryTemplateId,
+  };
+};
+
+const sendCasemateEmail = async (opts: {
+  templateId: string;
+  toEmail: string;
+  toName: string;
+  subject: string;
+  message: string;
+  extra?: Record<string, string>;
+}): Promise<boolean> => {
+  const keys = await resolveKeys();
+  if (!keys.serviceId || !keys.publicKey || !opts.templateId) {
+    console.error('[Email] EmailJS configuration missing.');
+    return false;
+  }
+  if (!opts.toEmail) return false;
+
+  await emailjs.send(
+    keys.serviceId,
+    opts.templateId,
+    {
+      to_email: opts.toEmail,
+      to_name: opts.toName || 'Advocate',
+      from_name: 'casemate',
+      subject: opts.subject,
+      message: opts.message,
+      app_name: 'casemate',
+      app_url: 'https://legalai-78759.web.app',
+      ...(opts.extra || {}),
+    },
+    keys.publicKey
+  );
+  return true;
+};
+
+/** 1. Welcome email after signup */
+export const sendWelcomeEmail = async (userEmail: string, userName: string): Promise<boolean> => {
+  try {
+    const keys = await resolveKeys();
+    const ok = await sendCasemateEmail({
+      templateId: keys.welcomeTemplateId,
+      toEmail: userEmail,
+      toName: userName,
+      subject: 'Welcome to casemate',
+      message:
+        `Dear ${userName || 'Advocate'},\n\n` +
+        `Welcome to casemate — your AI legal drafting assistant.\n\n` +
+        `Your account has been created successfully. Please verify your email if you haven't already, then sign in to start drafting.\n\n` +
+        `Website: https://legalai-78759.web.app\n\n` +
+        `Regards,\nTeam casemate`,
+    });
+    if (ok) console.log('[Email] Welcome email sent to', userEmail);
+    return ok;
   } catch (error) {
-    console.error("Error sending welcome email:", error);
+    console.error('[Email] Welcome failed:', error);
+    return false;
   }
 };
 
-// 2. Plan Purchase Email
-export const sendPurchaseEmail = async (userEmail: string, userName: string, planName: string) => {
+/** 2. After successful payment / plan upgrade */
+export const sendPurchaseEmail = async (
+  userEmail: string,
+  userName: string,
+  planName: string,
+  expiryDate?: number | null
+): Promise<boolean> => {
   try {
-    if (!EMAILJS_SERVICE_ID || !EMAILJS_PUBLIC_KEY || !PURCHASE_TEMPLATE_ID) {
-      console.error("EmailJS configuration missing in .env file.");
-      return;
-    }
-
-    await emailjs.send(
-      EMAILJS_SERVICE_ID,
-      PURCHASE_TEMPLATE_ID,
-      { to_email: userEmail, to_name: userName, message: `Thank you for purchasing the ${planName}! Your subscription is now active.` },
-      EMAILJS_PUBLIC_KEY
-    );
-    console.log("Purchase email sent!");
+    const keys = await resolveKeys();
+    const expiryText = expiryDate
+      ? `\nYour plan is active until: ${new Date(expiryDate).toLocaleDateString('en-IN', {
+          day: 'numeric',
+          month: 'long',
+          year: 'numeric',
+        })}.`
+      : '';
+    const ok = await sendCasemateEmail({
+      templateId: keys.purchaseTemplateId,
+      toEmail: userEmail,
+      toName: userName,
+      subject: `casemate — ${planName} activated`,
+      message:
+        `Dear ${userName || 'Advocate'},\n\n` +
+        `Thank you for upgrading to ${planName}.\n\n` +
+        `Your payment was successful and your subscription is now active.${expiryText}\n\n` +
+        `You can continue using casemate with your new plan limits.\n\n` +
+        `Regards,\nTeam casemate`,
+      extra: {
+        plan_name: planName,
+        expiry_date: expiryDate ? new Date(expiryDate).toISOString() : '',
+      },
+    });
+    if (ok) console.log('[Email] Purchase email sent to', userEmail);
+    return ok;
   } catch (error) {
-    console.error("Error sending purchase email:", error);
+    console.error('[Email] Purchase failed:', error);
+    return false;
   }
 };
 
-// 3. Plan Expiry Alert Email
-export const sendExpiryAlertEmail = async (userEmail: string, userName: string) => {
+/** 3. Plan expiry reminder */
+export const sendExpiryAlertEmail = async (
+  userEmail: string,
+  userName: string,
+  daysLeft: number,
+  planName?: string
+): Promise<boolean> => {
   try {
-    if (!EMAILJS_SERVICE_ID || !EMAILJS_PUBLIC_KEY || !EXPIRY_TEMPLATE_ID) {
-      console.error("EmailJS configuration missing in .env file.");
-      return;
-    }
-
-    await emailjs.send(
-      EMAILJS_SERVICE_ID,
-      EXPIRY_TEMPLATE_ID,
-      { to_email: userEmail, to_name: userName, message: "Your casemate subscription plan is about to expire soon. Please renew to continue uninterrupted service." },
-      EMAILJS_PUBLIC_KEY
-    );
-    console.log("Expiry alert email sent!");
+    const keys = await resolveKeys();
+    const planLabel = planName || 'your subscription';
+    const ok = await sendCasemateEmail({
+      templateId: keys.expiryTemplateId,
+      toEmail: userEmail,
+      toName: userName,
+      subject: `casemate — ${planLabel} expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`,
+      message:
+        `Dear ${userName || 'Advocate'},\n\n` +
+        `This is a reminder that ${planLabel} will expire in ${daysLeft} day${daysLeft === 1 ? '' : 's'}.\n\n` +
+        `Please renew your plan to continue uninterrupted access to drafting and advanced features.\n\n` +
+        `Renew here: https://legalai-78759.web.app\n\n` +
+        `Regards,\nTeam casemate`,
+      extra: {
+        days_left: String(daysLeft),
+        plan_name: planLabel,
+      },
+    });
+    if (ok) console.log('[Email] Expiry reminder sent to', userEmail, 'daysLeft=', daysLeft);
+    return ok;
   } catch (error) {
-    console.error("Error sending expiry alert email:", error);
+    console.error('[Email] Expiry reminder failed:', error);
+    return false;
+  }
+};
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * If paid plan expires within 7 / 3 / 1 days, send a reminder once per threshold.
+ * Safe to call on every app open.
+ */
+export const checkAndSendExpiryReminder = async (user: {
+  id: string;
+  email?: string;
+  name?: string;
+  plan?: string | null;
+  subscriptionExpiryDate?: number | null;
+}): Promise<void> => {
+  try {
+    if (!user?.id || !user.email) return;
+    if (!user.plan || user.plan === 'free') return;
+    const expiry = user.subscriptionExpiryDate;
+    if (!expiry || typeof expiry !== 'number') return;
+
+    const msLeft = expiry - Date.now();
+    if (msLeft <= 0) return;
+
+    const daysLeft = Math.ceil(msLeft / DAY_MS);
+    const thresholds = [7, 3, 1];
+    const hit = thresholds.find((t) => daysLeft <= t && daysLeft > 0);
+    if (!hit) return;
+
+    const storageKey = `casemate_expiry_email_${user.id}_${hit}`;
+    if (localStorage.getItem(storageKey) === '1') return;
+
+    const planName =
+      user.plan === 'basic' ? 'Basic Plan' : user.plan === 'annual' ? 'Annual Plan' : 'Pro Plan';
+
+    const ok = await sendExpiryAlertEmail(user.email, user.name || 'Advocate', daysLeft, planName);
+    if (ok) {
+      localStorage.setItem(storageKey, '1');
+      try {
+        await setDoc(
+          doc(db, 'users_data', user.id),
+          { lastExpiryEmailThreshold: hit, lastExpiryEmailAt: Date.now() },
+          { merge: true }
+        );
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch (e) {
+    console.error('[Email] checkAndSendExpiryReminder failed', e);
   }
 };

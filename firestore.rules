@@ -1,0 +1,59 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Only this account may edit plans / prices / keys from the admin panel.
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.token.email in ['admin@casemate.com'];
+    }
+
+    // Fields only the backend (Admin SDK, which bypasses these rules) may change.
+    // Same-value writes are not "affected keys", so existing app builds that
+    // re-send their current plan on every sync keep working; only an actual
+    // change (e.g. free -> pro without paying) is rejected.
+    function entitlementsUnchanged() {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+        .hasAny(['plan', 'subscriptionExpiryDate', 'aiUsage', 'devices', 'planSource', 'planOrderId']);
+    }
+
+    // Per-user chat / profile data (and per-chat docs under /chats/{chatId})
+    match /users_data/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+
+      // A new account may only start on the free plan.
+      allow create: if request.auth != null && request.auth.uid == userId
+        && (!('plan' in request.resource.data) || request.resource.data.plan == 'free')
+        && !request.resource.data.keys().hasAny(['aiUsage', 'devices', 'planSource', 'planOrderId']);
+
+      allow update: if request.auth != null && request.auth.uid == userId
+        && entitlementsUnchanged();
+
+      allow delete: if false;
+
+      match /chats/{chatId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+    }
+
+    // Admin panel → all phones (plans, announcement, templates)
+    // Public read so every app install receives live price/announcement updates.
+    match /app_config/{docId} {
+      allow read: if docId in ['plans', 'announcement', 'templates'] || isAdmin();
+      allow write: if isAdmin()
+        && docId in ['plans', 'announcement', 'templates', 'api_keys', 'email_keys'];
+    }
+
+    // Payment records are written by the backend only.
+    match /orders/{orderId} {
+      allow read, write: if false;
+    }
+
+    // Anonymized draft-style memory (structure only — no names/facts)
+    match /learned_styles/{id} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null;
+      allow delete: if false;
+    }
+  }
+}

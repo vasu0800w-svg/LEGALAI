@@ -19,6 +19,7 @@ export default defineConfig(({ mode }) => {
         '/api/validate-chat-limits': 'http://127.0.0.1:5000',
         '/api/create-order': 'http://127.0.0.1:5000',
         '/api/verify-payment': 'http://127.0.0.1:5000',
+        '/api/gemini': 'http://127.0.0.1:5000',
         '/ws-proxy': { target: 'ws://127.0.0.1:5000', ws: true },
       },
     },

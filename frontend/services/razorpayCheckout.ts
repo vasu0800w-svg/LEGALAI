@@ -2,20 +2,37 @@
  * Razorpay Standard Web Checkout helpers (KEY_ID only on frontend).
  */
 
+import { Capacitor } from '@capacitor/core';
+
 export type RazorpaySuccessPayload = {
   razorpay_payment_id: string;
   razorpay_order_id: string;
   razorpay_signature: string;
 };
 
+export type VerifiedPlan = {
+  planId: string;
+  subscriptionExpiryDate: number | null;
+};
+
 type CheckoutArgs = {
-  amountRupees: number;
+  /** Server prices the plan — the phone never sends an amount. */
+  planId: string;
   description: string;
   prefill?: { name?: string; email?: string; contact?: string };
-  onVerified: (payload: RazorpaySuccessPayload) => void | Promise<void>;
+  onVerified: (payload: RazorpaySuccessPayload, plan: VerifiedPlan) => void | Promise<void>;
 };
 
 const apiBase = () => (import.meta as any).env?.VITE_API_BASE_URL || '';
+
+const authHeader = async (): Promise<Record<string, string>> => {
+  const { auth } = await import('./firebaseService');
+  const token = await auth.currentUser?.getIdToken();
+  if (!token) {
+    throw new Error('Please sign in again before paying.');
+  }
+  return { Authorization: `Bearer ${token}` };
+};
 
 async function ensureCheckoutScript(): Promise<boolean> {
   if ((window as any).Razorpay) return true;
@@ -34,19 +51,12 @@ export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
     throw new Error('VITE_RAZORPAY_KEY_ID is missing. Add it to frontend/.env');
   }
 
-  const amountPaise = Math.round(Number(args.amountRupees) * 100);
-  if (!Number.isFinite(amountPaise) || amountPaise < 100) {
-    throw new Error('Minimum payment amount is ₹1 (100 paise).');
-  }
+  const headers = await authHeader();
 
   const orderRes = await fetch(`${apiBase()}/api/create-order`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      amount: amountPaise,
-      currency: 'INR',
-      receipt: `rcpt_${Date.now()}`.slice(0, 40),
-    }),
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify({ planId: args.planId }),
   });
 
   const orderData = await orderRes.json().catch(() => ({}));
@@ -60,6 +70,8 @@ export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
   }
 
   const isTestKey = String(keyId).startsWith('rzp_test_');
+  // Capacitor Android WebView hides UPI unless webview_intent is set (Razorpay docs).
+  const isNativeWebView = Capacitor.isNativePlatform();
 
   const options = {
     key: keyId,
@@ -83,8 +95,17 @@ export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
             wallet: true,
           },
         }
-      : {}),
-    theme: { color: '#2563eb' },
+      : {
+          method: {
+            netbanking: true,
+            card: true,
+            upi: true,
+            wallet: true,
+          },
+        }),
+    // Required for UPI Intent inside Android/iOS in-app WebViews
+    ...(isNativeWebView && !isTestKey ? { webview_intent: true } : {}),
+    theme: { color: '#0a0a0a' },
     modal: {
       ondismiss: () => {
         console.info('[Razorpay] Checkout dismissed by user');
@@ -94,7 +115,7 @@ export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
       try {
         const verifyRes = await fetch(`${apiBase()}/api/verify-payment`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...(await authHeader()) },
           body: JSON.stringify({
             razorpay_order_id: response.razorpay_order_id,
             razorpay_payment_id: response.razorpay_payment_id,
@@ -106,7 +127,10 @@ export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
           alert(verifyData?.message || 'Payment verification failed. Please contact support.');
           return;
         }
-        await args.onVerified(response);
+        await args.onVerified(response, {
+          planId: String(verifyData.planId || args.planId),
+          subscriptionExpiryDate: Number(verifyData.subscriptionExpiryDate) || null,
+        });
       } catch (err: any) {
         console.error('[Razorpay] verify error', err);
         alert(err?.message || 'Could not verify payment.');

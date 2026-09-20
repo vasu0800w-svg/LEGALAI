@@ -2,4 +2,17 @@
 .env.local
 node_modules/
 dist/
+.firebase/
+.today-backup-*/
 .DS_Store
+*.jks
+*.keystore
+frontend/android/keystore.properties
+frontend/android/app/release/
+frontend/android/app/build/
+frontend/android/.gradle/
+frontend/android/local.properties
+frontend/android/captures/
+*.aab
+*.apk
+casemate-robo-login.json
