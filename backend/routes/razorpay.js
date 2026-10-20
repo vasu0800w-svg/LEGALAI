@@ -21,15 +21,52 @@ const cors = (res) => {
 
 const VALID_PLANS = ['basic', 'pro', 'annual'];
 
-function getRazorpayClient() {
-  const key_id = process.env.RAZORPAY_KEY_ID;
-  const key_secret = process.env.RAZORPAY_KEY_SECRET;
-  if (!key_id || !key_secret) {
+const pairFrom = (id, secret) => {
+  const key_id = String(id || '').trim();
+  const key_secret = String(secret || '').trim();
+  if (!key_id || !key_secret) return null;
+  return {
+    key_id,
+    key_secret,
+    mode: key_id.startsWith('rzp_live_') ? 'live' : 'test',
+  };
+};
+
+let cachedKeys = null;
+let cachedKeysAt = 0;
+
+/** Live keys win over test keys. Env live beats a live key saved in the admin panel. */
+export async function resolveRazorpayKeys() {
+  if (cachedKeys && Date.now() - cachedKeysAt < 30_000) return cachedKeys;
+  const envPair = pairFrom(process.env.RAZORPAY_KEY_ID, process.env.RAZORPAY_KEY_SECRET);
+  let cloudPair = null;
+  if (adminReady()) {
+    try {
+      const snap = await getDb().collection('app_config').doc('api_keys').get();
+      const data = snap.exists ? snap.data() : null;
+      cloudPair = pairFrom(data?.razorpayKeyId, data?.razorpayKeySecret);
+    } catch (err) {
+      console.warn('[Razorpay] cloud key read failed', err?.message || err);
+    }
+  }
+  const chosen =
+    (envPair?.mode === 'live' && envPair) ||
+    (cloudPair?.mode === 'live' && cloudPair) ||
+    envPair ||
+    cloudPair;
+  if (!chosen) {
     const err = new Error('Razorpay credentials are not configured on the server.');
     err.statusCode = 500;
     throw err;
   }
-  return new Razorpay({ key_id, key_secret });
+  cachedKeys = chosen;
+  cachedKeysAt = Date.now();
+  return chosen;
+}
+
+async function getRazorpayClient() {
+  const keys = await resolveRazorpayKeys();
+  return { client: new Razorpay({ key_id: keys.key_id, key_secret: keys.key_secret }), keys };
 }
 
 /** Live price from the admin panel, falling back to the built-in default. */
@@ -87,7 +124,7 @@ export async function createOrderHandler(req, res) {
       });
     }
 
-    const razorpay = getRazorpayClient();
+    const { client: razorpay, keys } = await getRazorpayClient();
     const order = await razorpay.orders.create({
       amount: amountPaise,
       currency: 'INR',
@@ -110,6 +147,8 @@ export async function createOrderHandler(req, res) {
       currency: order.currency,
       planId,
       amountRupees: rupees,
+      key_id: keys.key_id,
+      mode: keys.mode,
     });
   } catch (err) {
     console.error('[Razorpay] create-order error:', err);
@@ -147,7 +186,7 @@ export async function verifyPaymentHandler(req, res) {
       });
     }
 
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    const keySecret = (await resolveRazorpayKeys()).key_secret;
     if (!keySecret) {
       return res.status(500).json({
         error: 'NOT_CONFIGURED',

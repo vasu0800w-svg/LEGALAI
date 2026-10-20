@@ -99,6 +99,11 @@ const toSdkConfig = (config, model) => {
   }
   if (typeof config?.temperature === 'number') out.temperature = config.temperature;
 
+  // Only live web search is allowed through; clients cannot request other tools.
+  if (Array.isArray(config?.tools) && config.tools.some((t) => t && t.googleSearch)) {
+    out.tools = [{ googleSearch: {} }];
+  }
+
   const think = config?.thinkingConfig;
   if (think && typeof think === 'object') {
     out.thinkingConfig = usesThinkingLevel(model)
@@ -114,6 +119,25 @@ const extractText = (response) => {
   const parts = response?.candidates?.[0]?.content?.parts;
   if (!Array.isArray(parts)) return '';
   return parts.map((p) => p.text || '').join('');
+};
+
+/** Web pages Gemini actually used when search was on (deduped by site title). */
+const extractSources = (response) => {
+  const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks;
+  if (!Array.isArray(chunks)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const c of chunks) {
+    const uri = c?.web?.uri;
+    if (!uri || !/^https?:\/\//i.test(uri)) continue;
+    const title = String(c?.web?.title || '').slice(0, 80) || 'source';
+    const key = title.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ title, uri });
+    if (out.length >= 5) break;
+  }
+  return out;
 };
 
 export function geminiOptionsHandler(req, res) {
@@ -175,7 +199,10 @@ export async function geminiHandler(req, res) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const response = await ai.models.generateContent(request);
-      return res.status(200).json({ text: extractText(response) });
+      return res.status(200).json({
+        text: extractText(response),
+        sources: extractSources(response),
+      });
     } catch (err) {
       lastStatus = errStatus(err) || 502;
       lastMessage = String(err?.message || 'Gemini request failed');

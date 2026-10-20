@@ -10,6 +10,7 @@
  */
 import { adminReady, getDb, userDoc } from './firebaseAdmin.js';
 import { getPlanLimits } from '../middleware/planLimits.js';
+import { loadPromoCodes } from '../lib/promoCodes.js';
 
 /** A device slot is released after this many days without use. */
 const DEVICE_STALE_DAYS = 14;
@@ -55,13 +56,14 @@ export const reserveAiRequest = async ({ uid, email, deviceId, contents }) => {
   const images = countImages(contents);
   const now = Date.now();
   const month = monthKey();
+  const codes = await loadPromoCodes().catch(() => null);
 
   try {
     return await db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       const data = snap.exists ? snap.data() : {};
       const plan = effectivePlan(data);
-      const limits = getPlanLimits(plan, email || data.email);
+      const limits = getPlanLimits(plan, email || data.email, data, codes);
 
       const prev = data.aiUsage && data.aiUsage.month === month
         ? data.aiUsage

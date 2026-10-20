@@ -95,3 +95,16 @@ export const verifyFirebaseIdToken = async (idToken) => {
   if (!app) throw new Error('Firebase Admin app not initialised');
   return getAuth(app).verifyIdToken(idToken);
 };
+
+/** Inbox email uses this link. The continue page must be an authorized domain. */
+export const createEmailVerificationLink = async (email) => {
+  if (!app || !adminReady()) {
+    throw new Error('FIREBASE_SERVICE_ACCOUNT is not set');
+  }
+  const address = String(email || '').trim();
+  if (!address) throw new Error('Email is required');
+  return getAuth(app).generateEmailVerificationLink(address, {
+    url: 'https://meetcasemate.com',
+    handleCodeInApp: false,
+  });
+};

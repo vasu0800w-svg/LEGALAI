@@ -2,10 +2,21 @@
  * Plan-wise draft / message / session character limits.
  * Keep in sync with frontend/utils/planLimits.ts
  */
+import { isPromoActive } from '../lib/promoCodes.js';
 
 const UNLIMITED_EMAILS = new Set([
   'nt9234536@gmail.com',
   'shuchirajput22@gmail.com',
+  'sourabhmishra.law@gmail.com',
+  'vibhav.tiwari40@gmail.com',
+  'kajol.dewangan1995@gmail.com',
+  'yashthakur.1982@gmail.com',
+  'sunilnandi171@gmail.com',
+  'ajaysahu3003@gmail.com',
+  'rakesh25475@gmail.com',
+  'vinodkujur1@gmail.com',
+  'kujurmanoj@gmail.com',
+  'sshrivastava86@gmail.com',
 ]);
 
 export function isUnlimitedEmail(email) {
@@ -13,8 +24,8 @@ export function isUnlimitedEmail(email) {
   return UNLIMITED_EMAILS.has(email.trim().toLowerCase());
 }
 
-export function getPlanLimits(plan, email) {
-  if (isUnlimitedEmail(email)) {
+export function getPlanLimits(plan, email, userData = null, codes = null) {
+  if (isUnlimitedEmail(email) || (userData && codes && isPromoActive(userData, codes))) {
     return {
       draftLimit: Number.POSITIVE_INFINITY,
       maxMessageChars: 500000,
@@ -61,7 +72,7 @@ export function getPlanLimits(plan, email) {
     maxMessageChars: 4000,
     maxSessionChars: 20000,
     chatSessionLimit: 50,
-    dailyUses: 1,
+    dailyUses: Number.POSITIVE_INFINITY,
     monthlyAiRequests: 120,
     monthlyImages: 150,
     maxDevices: 2,

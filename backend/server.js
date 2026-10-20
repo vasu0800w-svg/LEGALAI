@@ -11,8 +11,10 @@ import fetch from 'node-fetch';
 import rateLimit from 'express-rate-limit';
 import { WebSocketServer, WebSocket } from 'ws';
 import { validateChatLimitsMiddleware, getPlanLimits } from './middleware/planLimits.js';
-import { createOrderHandler, verifyPaymentHandler, razorpayOptionsHandler } from './routes/razorpay.js';
+import { createOrderHandler, verifyPaymentHandler, razorpayOptionsHandler, resolveRazorpayKeys } from './routes/razorpay.js';
 import { geminiHandler, geminiOptionsHandler } from './routes/gemini.js';
+import { verificationLinkHandler, verificationLinkOptionsHandler } from './routes/verificationLink.js';
+import { redeemPromoHandler, promoStatusHandler, promoOptionsHandler } from './routes/promo.js';
 import { attachAuthUser } from './lib/authUser.js';
 import { adminReady } from './lib/firebaseAdmin.js';
 
@@ -37,11 +39,18 @@ if (!vertexEnabled) {
 app.set('trust proxy', 1 /* number of proxies between user and server */);
 
 // Health check for Render
-app.get('/', (_req, res) => {
+app.get('/', async (_req, res) => {
+  let razorpayMode = 'missing';
+  try {
+    razorpayMode = (await resolveRazorpayKeys()).mode;
+  } catch {
+    razorpayMode = 'missing';
+  }
   res.status(200).json({
     ok: true,
     service: 'casemate-api',
-    razorpay: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
+    razorpay: razorpayMode !== 'missing',
+    razorpayMode,
     gemini: Boolean(process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY),
     firebaseAdmin: adminReady(),
     vertexProxy: vertexEnabled,
@@ -122,6 +131,34 @@ const geminiLimiter = rateLimit({
 
 app.options('/api/gemini', geminiOptionsHandler);
 app.post('/api/gemini', attachAuthUser, geminiLimiter, geminiHandler);
+
+const verificationLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.authUser?.uid || req.ip || 'unknown',
+  message: {
+    error: 'RATE_LIMIT',
+    message: 'Too many verification emails. Please wait a minute.',
+  },
+});
+
+app.options('/api/verification-link', verificationLinkOptionsHandler);
+app.post('/api/verification-link', attachAuthUser, verificationLimiter, verificationLinkHandler);
+
+const promoLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.authUser?.uid || req.ip || 'unknown',
+  message: { error: 'RATE_LIMIT', message: 'Too many promo attempts. Please wait a minute.' },
+});
+app.options('/api/redeem-promo', promoOptionsHandler);
+app.options('/api/promo-status', promoOptionsHandler);
+app.post('/api/redeem-promo', attachAuthUser, promoLimiter, redeemPromoHandler);
+app.post('/api/promo-status', attachAuthUser, promoLimiter, promoStatusHandler);
 
 const API_CLIENT_MAP = [
  {
