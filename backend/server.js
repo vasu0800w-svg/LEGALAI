@@ -15,6 +15,17 @@ import { createOrderHandler, verifyPaymentHandler, razorpayOptionsHandler, resol
 import { geminiHandler, geminiOptionsHandler } from './routes/gemini.js';
 import { verificationLinkHandler, verificationLinkOptionsHandler } from './routes/verificationLink.js';
 import { redeemPromoHandler, promoStatusHandler, promoOptionsHandler } from './routes/promo.js';
+import {
+  entitlementsHandler,
+  entitlementsOptionsHandler,
+  devicesHandler,
+  revokeDeviceHandler,
+} from './routes/entitlements.js';
+import {
+  customPlanOptionsHandler,
+  customPlanCatalogHandler,
+  customPlanQuoteHandler,
+} from './routes/customPlan.js';
 import { attachAuthUser } from './lib/authUser.js';
 import { adminReady } from './lib/firebaseAdmin.js';
 
@@ -79,14 +90,14 @@ if (vertexEnabled) {
   app.use('/api-proxy', proxyLimiter);
 }
 
-// Validate plan-wise message / session character limits
-app.post('/api/validate-chat-limits', (req, res) => {
+// Validate plan-wise message / session character limits for the signed-in user.
+app.post('/api/validate-chat-limits', attachAuthUser, (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   validateChatLimitsMiddleware(req, res, () => {
     res.status(200).json({
       ok: true,
-      limits: req.planLimits || getPlanLimits(req.body?.plan),
+      limits: req.planLimits || getPlanLimits('free'),
     });
   });
 });
@@ -94,9 +105,28 @@ app.post('/api/validate-chat-limits', (req, res) => {
 app.options('/api/validate-chat-limits', (_req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.status(204).end();
 });
+
+app.options('/api/entitlements', entitlementsOptionsHandler);
+app.get('/api/entitlements', attachAuthUser, entitlementsHandler);
+app.options('/api/devices', entitlementsOptionsHandler);
+app.get('/api/devices', attachAuthUser, devicesHandler);
+app.options('/api/devices/revoke', entitlementsOptionsHandler);
+app.post('/api/devices/revoke', attachAuthUser, revokeDeviceHandler);
+
+const customPlanLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'RATE_LIMIT', message: 'Too many custom-plan quotes. Please wait a minute.' },
+});
+app.options('/api/custom-plan', customPlanOptionsHandler);
+app.options('/api/custom-plan/quote', customPlanOptionsHandler);
+app.get('/api/custom-plan', customPlanLimiter, customPlanCatalogHandler);
+app.post('/api/custom-plan/quote', customPlanLimiter, customPlanQuoteHandler);
 
 // Razorpay Standard Checkout
 const paymentLimiter = rateLimit({

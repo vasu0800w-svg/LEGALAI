@@ -7,14 +7,14 @@
  */
 import { GoogleGenAI } from '@google/genai';
 import { verifyRequestUser } from '../lib/authUser.js';
-import { reserveAiRequest } from '../lib/usageGuard.js';
+import { reserveAiRequest, releaseAiRequest, reserveDraft, releaseDraft } from '../lib/usageGuard.js';
 
 const DEFAULT_MODEL = 'gemini-3.8-flash';
 
 const cors = (res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Id');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Id, X-Work-Kind');
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -171,6 +171,9 @@ export async function geminiHandler(req, res) {
     return res.status(400).json({ error: 'MISSING_CONTENTS', message: 'contents is required.' });
   }
 
+  let reserved = false;
+  let reservedDraft = false;
+  const workKind = String(req.headers['x-work-kind'] || req.body?.workKind || 'analysis').toLowerCase();
   if (authUser) {
     const reservation = await reserveAiRequest({
       uid: authUser.uid,
@@ -179,11 +182,23 @@ export async function geminiHandler(req, res) {
       contents,
     });
     if (!reservation.ok) {
-      const status = reservation.code === 'DEVICE_LIMIT' ? 403 : 429;
+      const status = reservation.code === 'DEVICE_LIMIT' || reservation.code === 'UPLOAD_PHOTO_LIMIT' ? 403 : 429;
       return res.status(status).json({
         error: reservation.code,
         message: reservation.message,
       });
+    }
+    reserved = !reservation.skipped;
+    if (workKind === 'draft') {
+      const draft = await reserveDraft({ uid: authUser.uid, email: authUser.email });
+      if (!draft.ok) {
+        if (reserved) await releaseAiRequest({ uid: authUser.uid, contents }).catch(() => {});
+        return res.status(429).json({
+          error: draft.code,
+          message: draft.message,
+        });
+      }
+      reservedDraft = !draft.skipped;
     }
   }
 
@@ -211,7 +226,14 @@ export async function geminiHandler(req, res) {
     }
   }
 
-  console.error('[gemini] upstream failed:', lastStatus, lastMessage.slice(0, 300));
+  if (reserved && authUser) {
+    await releaseAiRequest({ uid: authUser.uid, contents }).catch(() => {});
+  }
+  if (reservedDraft && authUser) {
+    await releaseDraft({ uid: authUser.uid }).catch(() => {});
+  }
+
+  console.error('[gemini] upstream failed:', lastStatus, String(lastMessage).slice(0, 180));
   return res.status(lastStatus >= 400 ? lastStatus : 502).json({
     error: 'GEMINI_FAILED',
     message: lastMessage.slice(0, 180),

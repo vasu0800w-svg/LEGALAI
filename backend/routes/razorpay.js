@@ -9,9 +9,22 @@
  */
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
-import { adminReady, adminInitError, getDb, userDoc, orderDoc } from '../lib/firebaseAdmin.js';
+import { adminReady, adminInitError, getDb, userDoc, orderDoc, paymentDoc } from '../lib/firebaseAdmin.js';
 import { verifyRequestUser } from '../lib/authUser.js';
-import { DEFAULT_PLAN_PRICES, PLAN_DURATION_DAYS } from '../middleware/planLimits.js';
+import { DEFAULT_PLAN_PRICES, PLAN_DURATION_DAYS, DEFAULT_PAID_LIMITS, getPlanLimits, loadFreePlanLimits } from '../middleware/planLimits.js';
+import { loadPlanCatalog, addonById, isChatLimitAddon } from '../lib/planCatalog.js';
+import { effectivePlan } from '../lib/usageGuard.js';
+import { quoteCustomPlan } from '../lib/customPlan.js';
+import { loadCustomPricing } from './customPlan.js';
+import {
+  nextExpiryFrom,
+  nextPlanAfterPurchase,
+  mergeAddOnGrants,
+  appendBillingHistory,
+  preferRicherLimits,
+  CATALOG_VERSION,
+  persistLimits,
+} from '../lib/entitlementMath.js';
 
 const cors = (res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -107,15 +120,80 @@ export async function createOrderHandler(req, res) {
       });
     }
 
+    const addOnId = String(req.body?.addOnId || '').trim();
     const planId = String(req.body?.planId || '').trim();
-    if (!VALID_PLANS.includes(planId)) {
+    let kind = 'plan';
+    let sku = planId;
+    let rupees = 0;
+
+    let addonGrants = null;
+    let customPayload = null;
+    if (addOnId) {
+      const catalog = await loadPlanCatalog();
+      const addon = addonById(catalog, addOnId);
+      if (!addon || !(Number(addon.price) > 0)) {
+        return res.status(400).json({
+          error: 'INVALID_ADDON',
+          message: 'Unknown add-on.',
+        });
+      }
+      kind = 'addon';
+      sku = addon.id;
+      rupees = Math.round(Number(addon.price));
+      addonGrants = addon.grants && typeof addon.grants === 'object' ? addon.grants : {};
+      if (isChatLimitAddon(addon)) {
+        await loadFreePlanLimits().catch(() => null);
+        let userData = {};
+        try {
+          const snap = await userDoc(authUser.uid).get();
+          userData = snap.exists ? snap.data() || {} : {};
+        } catch (err) {
+          console.warn('[Razorpay] user read for add-on eligibility failed', err?.message || err);
+        }
+        const limits = getPlanLimits(
+          effectivePlan(userData),
+          authUser.email || userData.email,
+          userData,
+          null
+        );
+        if (!Number.isFinite(limits.maxSessionChars)) {
+          return res.status(400).json({
+            error: 'ADDON_NO_BENEFIT',
+            message: 'Your current plan already has no chat character cap, so this increase would not add capacity.',
+          });
+        }
+      }
+    } else if (planId === 'custom' || req.body?.kind === 'custom') {
+      const pricing = await loadCustomPricing();
+      const quote = quoteCustomPlan(req.body?.selection || req.body?.customSelection, pricing);
+      if (!quote.ok) {
+        return res.status(400).json({
+          error: 'INVALID_CUSTOM_PLAN',
+          message: quote.errors[0] || 'That custom plan cannot be purchased.',
+          errors: quote.errors,
+        });
+      }
+      kind = 'custom';
+      sku = 'custom';
+      rupees = quote.totalRupees;
+      customPayload = {
+        selection: quote.selection,
+        lines: quote.lines,
+        limits: persistLimits(quote.limits),
+        subtotalRupees: quote.subtotalRupees,
+        taxRupees: quote.taxRupees,
+        taxPercent: quote.taxPercent,
+        totalRupees: quote.totalRupees,
+      };
+    } else if (VALID_PLANS.includes(planId)) {
+      rupees = await resolvePlanPrice(planId);
+    } else {
       return res.status(400).json({
         error: 'INVALID_PLAN',
         message: 'Unknown subscription plan.',
       });
     }
 
-    const rupees = await resolvePlanPrice(planId);
     const amountPaise = Math.round(rupees * 100);
     if (!Number.isFinite(amountPaise) || amountPaise < 100) {
       return res.status(400).json({
@@ -129,13 +207,26 @@ export async function createOrderHandler(req, res) {
       amount: amountPaise,
       currency: 'INR',
       receipt: `rcpt_${Date.now()}`.slice(0, 40),
-      notes: { uid: authUser.uid, planId },
+      notes: {
+        uid: authUser.uid,
+        planId: kind === 'addon' ? '' : sku,
+        addOnId: kind === 'addon' ? sku : '',
+        kind,
+      },
     });
 
     await orderDoc(order.id).set({
       uid: authUser.uid,
       email: authUser.email || '',
-      planId,
+      kind,
+      planId: kind === 'addon' ? '' : sku,
+      addOnId: kind === 'addon' ? sku : '',
+      grants: addonGrants,
+      selection: customPayload?.selection || null,
+      lines: customPayload?.lines || null,
+      limits: customPayload?.limits || null,
+      quotedRupees: customPayload?.totalRupees || rupees,
+      taxPercent: customPayload?.taxPercent ?? 0,
       amount: amountPaise,
       status: 'created',
       createdAt: Date.now(),
@@ -145,8 +236,11 @@ export async function createOrderHandler(req, res) {
       order_id: order.id,
       amount: order.amount,
       currency: order.currency,
-      planId,
+      planId: kind === 'addon' ? undefined : sku,
+      addOnId: kind === 'addon' ? sku : undefined,
       amountRupees: rupees,
+      selection: customPayload?.selection,
+      lines: customPayload?.lines,
       key_id: keys.key_id,
       mode: keys.mode,
     });
@@ -228,67 +322,281 @@ export async function verifyPaymentHandler(req, res) {
       });
     }
 
+    const db = getDb();
     const orderRef = orderDoc(orderId);
-    const orderSnap = await orderRef.get();
-    if (!orderSnap.exists) {
-      return res.status(400).json({
-        error: 'UNKNOWN_ORDER',
-        message: 'This order was not created by casemate.',
-        success: false,
+    const payRef = paymentDoc(paymentId);
+    const userRef = userDoc(authUser.uid);
+
+    const grant = await db.runTransaction(async (tx) => {
+      const orderSnap = await tx.get(orderRef);
+      if (!orderSnap.exists) {
+        const err = new Error('UNKNOWN_ORDER');
+        err.code = 'UNKNOWN_ORDER';
+        throw err;
+      }
+      const order = orderSnap.data() || {};
+      if (order.uid !== authUser.uid) {
+        const err = new Error('ORDER_OWNER_MISMATCH');
+        err.code = 'ORDER_OWNER_MISMATCH';
+        throw err;
+      }
+      if (order.status === 'paid') {
+        return {
+          alreadyPaid: true,
+          kind: order.kind || 'plan',
+          planId: order.planId || null,
+          addOnId: order.addOnId || null,
+          subscriptionExpiryDate: order.subscriptionExpiryDate || null,
+          addOns: order.addOns || null,
+        };
+      }
+
+      const paySnap = await tx.get(payRef);
+      if (paySnap.exists) {
+        const prev = paySnap.data() || {};
+        if (prev.orderId && prev.orderId !== orderId) {
+          const err = new Error('DUPLICATE_PAYMENT');
+          err.code = 'DUPLICATE_PAYMENT';
+          throw err;
+        }
+        return {
+          alreadyPaid: true,
+          kind: prev.kind || 'plan',
+          planId: prev.planId || order.planId || null,
+          addOnId: prev.addOnId || order.addOnId || null,
+          subscriptionExpiryDate: prev.subscriptionExpiryDate || null,
+          addOns: prev.addOns || null,
+        };
+      }
+
+      const userSnap = await tx.get(userRef);
+      const userData = userSnap.exists ? userSnap.data() || {} : {};
+      const now = Date.now();
+      const kind = order.kind === 'addon' || order.addOnId
+        ? 'addon'
+        : order.kind === 'custom' || order.planId === 'custom'
+          ? 'custom'
+          : 'plan';
+
+      if (kind === 'addon') {
+        const addOnId = String(order.addOnId || '');
+        const grants = order.grants && typeof order.grants === 'object' ? order.grants : {};
+        const addOns = mergeAddOnGrants(userData.addOns, grants);
+        const billingHistory = appendBillingHistory(userData.billingHistory, {
+          at: now,
+          orderId,
+          paymentId,
+          amountPaise: Number(order.amount) || 0,
+          addOnId,
+          kind: 'addon',
+          status: 'paid',
+        });
+        tx.set(userRef, {
+          addOns,
+          billingHistory,
+          planSource: userData.planSource || 'razorpay',
+          planOrderId: orderId,
+          paymentStatus: 'paid',
+          updatedAt: now,
+        }, { merge: true });
+        tx.set(orderRef, {
+          status: 'paid',
+          paymentId,
+          paidAt: now,
+          addOns,
+        }, { merge: true });
+        tx.set(payRef, {
+          uid: authUser.uid,
+          orderId,
+          kind: 'addon',
+          addOnId,
+          addOns,
+          grantedAt: now,
+        });
+        return { alreadyPaid: false, kind: 'addon', addOnId, addOns, planId: userData.plan || 'free', subscriptionExpiryDate: userData.subscriptionExpiryDate || null };
+      }
+
+      if (kind === 'custom') {
+        const lockedLimits = order.limits && typeof order.limits === 'object' ? order.limits : null;
+        if (!lockedLimits) {
+          const err = new Error('CUSTOM_QUOTE_MISSING');
+          err.code = 'CUSTOM_QUOTE_MISSING';
+          throw err;
+        }
+        const days = PLAN_DURATION_DAYS.custom || 30;
+        const durationMs = days * 24 * 60 * 60 * 1000;
+        const currentExpiry = Number(userData.subscriptionExpiryDate || 0);
+        const subscriptionExpiryDate = nextExpiryFrom(currentExpiry, durationMs, now);
+        const nextPlan = nextPlanAfterPurchase(userData.plan, currentExpiry, 'custom', now);
+        const billingCycleStart = subscriptionExpiryDate - durationMs;
+        const quotedLimits = { ...lockedLimits };
+        for (const [key, value] of Object.entries(quotedLimits)) {
+          quotedLimits[key] = value == null ? Number.POSITIVE_INFINITY : Number(value);
+        }
+        const currentLimits = getPlanLimits(
+          String(userData.plan || 'free'),
+          authUser.email || userData.email,
+          userData,
+          null
+        );
+        const activePaid = String(userData.plan || 'free') !== 'free' && currentExpiry > now;
+        const grantedLimits = activePaid
+          ? preferRicherLimits(userData.grantedLimits || currentLimits, quotedLimits)
+          : { ...quotedLimits };
+        const customPlan = {
+          selection: order.selection || null,
+          lines: order.lines || [],
+          totalRupees: Number(order.quotedRupees) || Math.round((Number(order.amount) || 0) / 100),
+          taxPercent: Number(order.taxPercent) || 0,
+        };
+        const billingHistory = appendBillingHistory(userData.billingHistory, {
+          at: now,
+          orderId,
+          paymentId,
+          amountPaise: Number(order.amount) || 0,
+          planId: nextPlan,
+          kind: 'custom',
+          status: 'paid',
+        });
+        tx.set(userRef, {
+          plan: nextPlan,
+          subscriptionExpiryDate,
+          billingCycleStart,
+          planSource: 'razorpay',
+          planOrderId: orderId,
+          paymentStatus: 'paid',
+          entitlementsVersion: CATALOG_VERSION,
+          grantedLimits: persistLimits(grantedLimits),
+          customPlan,
+          billingHistory,
+          lastExpiryEmailThreshold: null,
+          updatedAt: now,
+        }, { merge: true });
+        tx.set(orderRef, {
+          status: 'paid',
+          paymentId,
+          paidAt: now,
+          planId: nextPlan,
+          purchasedPlanId: 'custom',
+          subscriptionExpiryDate,
+        }, { merge: true });
+        tx.set(payRef, {
+          uid: authUser.uid,
+          orderId,
+          kind: 'custom',
+          planId: nextPlan,
+          purchasedPlanId: 'custom',
+          subscriptionExpiryDate,
+          grantedAt: now,
+        });
+        return {
+          alreadyPaid: false,
+          kind: 'custom',
+          planId: nextPlan,
+          purchasedPlanId: 'custom',
+          subscriptionExpiryDate,
+          customPlan,
+        };
+      }
+
+      const planId = VALID_PLANS.includes(order.planId) ? order.planId : 'basic';
+      const days = PLAN_DURATION_DAYS[planId] || 30;
+      const durationMs = days * 24 * 60 * 60 * 1000;
+      const currentExpiry = Number(userData.subscriptionExpiryDate || 0);
+      const subscriptionExpiryDate = nextExpiryFrom(currentExpiry, durationMs, now);
+      const nextPlan = nextPlanAfterPurchase(userData.plan, currentExpiry, planId, now);
+      const billingCycleStart = subscriptionExpiryDate - durationMs;
+      const catalogLimits = DEFAULT_PAID_LIMITS[nextPlan] || DEFAULT_PAID_LIMITS.pro;
+      const currentLimits = getPlanLimits(
+        String(userData.plan || 'free'),
+        authUser.email || userData.email,
+        userData,
+        null
+      );
+      const activePaid = String(userData.plan || 'free') !== 'free' && currentExpiry > now;
+      const grantedLimits = activePaid
+        ? preferRicherLimits(userData.grantedLimits || currentLimits, catalogLimits)
+        : { ...catalogLimits };
+      const billingHistory = appendBillingHistory(userData.billingHistory, {
+        at: now,
+        orderId,
+        paymentId,
+        amountPaise: Number(order.amount) || 0,
+        planId: nextPlan,
+        kind: 'plan',
+        status: 'paid',
       });
-    }
-    const order = orderSnap.data();
-    if (order.uid !== authUser.uid) {
-      return res.status(403).json({
-        error: 'ORDER_OWNER_MISMATCH',
-        message: 'This payment belongs to a different account.',
-        success: false,
+
+      tx.set(userRef, {
+        plan: nextPlan,
+        subscriptionExpiryDate,
+        billingCycleStart,
+        planSource: 'razorpay',
+        planOrderId: orderId,
+        paymentStatus: 'paid',
+        entitlementsVersion: CATALOG_VERSION,
+        grantedLimits: persistLimits(grantedLimits),
+        billingHistory,
+        lastExpiryEmailThreshold: null,
+        updatedAt: now,
+      }, { merge: true });
+      tx.set(orderRef, {
+        status: 'paid',
+        paymentId,
+        paidAt: now,
+        planId: nextPlan,
+        purchasedPlanId: planId,
+        subscriptionExpiryDate,
+      }, { merge: true });
+      tx.set(payRef, {
+        uid: authUser.uid,
+        orderId,
+        kind: 'plan',
+        planId: nextPlan,
+        purchasedPlanId: planId,
+        subscriptionExpiryDate,
+        grantedAt: now,
       });
-    }
-    if (order.status === 'paid') {
+      return { alreadyPaid: false, kind: 'plan', planId: nextPlan, purchasedPlanId: planId, subscriptionExpiryDate };
+    });
+
+    if (grant.alreadyPaid) {
       return res.status(200).json({
         success: true,
         message: 'Payment already activated.',
-        planId: order.planId,
-        subscriptionExpiryDate: order.subscriptionExpiryDate || null,
+        planId: grant.planId,
+        addOnId: grant.addOnId || undefined,
+        subscriptionExpiryDate: grant.subscriptionExpiryDate || null,
       });
     }
 
-    const planId = VALID_PLANS.includes(order.planId) ? order.planId : 'basic';
-    const days = PLAN_DURATION_DAYS[planId] || 30;
-    const now = Date.now();
-
-    // Extend an existing subscription instead of shortening it.
-    const userSnap = await userDoc(authUser.uid).get();
-    const currentExpiry = Number(userSnap.exists ? userSnap.data()?.subscriptionExpiryDate || 0 : 0);
-    const base = currentExpiry > now ? currentExpiry : now;
-    const subscriptionExpiryDate = base + days * 24 * 60 * 60 * 1000;
-
-    await userDoc(authUser.uid).set({
-      plan: planId,
-      subscriptionExpiryDate,
-      planSource: 'razorpay',
-      planOrderId: orderId,
-      lastExpiryEmailThreshold: null,
-      updatedAt: now,
-    }, { merge: true });
-
-    await orderRef.set({
-      status: 'paid',
-      paymentId,
-      paidAt: now,
-      subscriptionExpiryDate,
-    }, { merge: true });
-
     return res.status(200).json({
       success: true,
-      message: 'Payment verified and plan activated.',
+      message: grant.kind === 'addon'
+        ? 'Payment verified and add-on activated.'
+        : grant.kind === 'custom'
+          ? 'Payment verified and custom plan activated.'
+          : 'Payment verified and plan activated.',
       order_id: orderId,
       payment_id: paymentId,
-      planId,
-      subscriptionExpiryDate,
+      planId: grant.planId,
+      addOnId: grant.addOnId || undefined,
+      subscriptionExpiryDate: grant.subscriptionExpiryDate,
     });
   } catch (err) {
+    const code = err?.code || '';
+    if (code === 'UNKNOWN_ORDER') {
+      return res.status(400).json({ error: code, message: 'This order was not created by casemate.', success: false });
+    }
+    if (code === 'ORDER_OWNER_MISMATCH') {
+      return res.status(403).json({ error: code, message: 'This payment belongs to a different account.', success: false });
+    }
+    if (code === 'DUPLICATE_PAYMENT') {
+      return res.status(409).json({ error: code, message: 'This payment was already used for another order.', success: false });
+    }
+    if (code === 'CUSTOM_QUOTE_MISSING') {
+      return res.status(400).json({ error: code, message: 'This custom-plan order has no locked quote. It was not activated.', success: false });
+    }
     console.error('[Razorpay] verify-payment error:', err);
     return res.status(500).json({
       error: 'VERIFY_FAILED',

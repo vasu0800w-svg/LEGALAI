@@ -7,7 +7,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon --env-file=.env.local server.js"
+    "dev": "nodemon --env-file=.env.local server.js",
+    "test": "node --test lib/entitlementMath.test.js lib/customPlan.test.js lib/planCatalog.test.js"
   },
   "engines": {
     "node": ">=18"

@@ -13,11 +13,15 @@ export type RazorpaySuccessPayload = {
 export type VerifiedPlan = {
   planId: string;
   subscriptionExpiryDate: number | null;
+  addOnId?: string;
 };
 
 type CheckoutArgs = {
   /** Server prices the plan — the phone never sends an amount. */
-  planId: string;
+  planId?: string;
+  kind?: 'plan' | 'addon' | 'custom';
+  addOnId?: string;
+  selection?: Record<string, unknown>;
   description: string;
   prefill?: { name?: string; email?: string; contact?: string };
   onVerified: (payload: RazorpaySuccessPayload, plan: VerifiedPlan) => void | Promise<void>;
@@ -46,17 +50,19 @@ async function ensureCheckoutScript(): Promise<boolean> {
 }
 
 export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
-  const keyId = (import.meta as any).env?.VITE_RAZORPAY_KEY_ID as string | undefined;
-  if (!keyId) {
-    throw new Error('VITE_RAZORPAY_KEY_ID is missing. Add it to frontend/.env');
-  }
+  const envKey = String((import.meta as any).env?.VITE_RAZORPAY_KEY_ID || '');
 
   const headers = await authHeader();
 
   const orderRes = await fetch(`${apiBase()}/api/create-order`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify({ planId: args.planId }),
+    body: JSON.stringify({
+      planId: args.planId,
+      kind: args.kind,
+      addOnId: args.addOnId,
+      selection: args.selection,
+    }),
   });
 
   const orderData = await orderRes.json().catch(() => ({}));
@@ -69,7 +75,12 @@ export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
     throw new Error('Razorpay Checkout failed to load. Check your internet connection.');
   }
 
-  const isTestKey = String(keyId).startsWith('rzp_test_');
+  // The order was created with the server key. Checkout must use that same key.
+  const keyId = String(orderData.key_id || envKey);
+  if (!keyId) {
+    throw new Error('Razorpay key is missing. Add the live key on the server.');
+  }
+  const isTestKey = keyId.startsWith('rzp_test_');
   // Capacitor Android WebView hides UPI unless webview_intent is set (Razorpay docs).
   const isNativeWebView = Capacitor.isNativePlatform();
 
@@ -128,8 +139,9 @@ export async function startRazorpayCheckout(args: CheckoutArgs): Promise<void> {
           return;
         }
         await args.onVerified(response, {
-          planId: String(verifyData.planId || args.planId),
+          planId: String(verifyData.planId || args.planId || ''),
           subscriptionExpiryDate: Number(verifyData.subscriptionExpiryDate) || null,
+          addOnId: verifyData.addOnId ? String(verifyData.addOnId) : args.addOnId,
         });
       } catch (err: any) {
         console.error('[Razorpay] verify error', err);

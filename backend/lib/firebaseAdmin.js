@@ -86,6 +86,7 @@ export const adminInitError = () => initError;
 export const getDb = () => db;
 export const userDoc = (uid) => db.collection('users_data').doc(uid);
 export const orderDoc = (orderId) => db.collection('orders').doc(orderId);
+export const paymentDoc = (paymentId) => db.collection('payments').doc(String(paymentId || ''));
 
 /**
  * Verify a Firebase ID token. Works without a service account because it only
