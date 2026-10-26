@@ -11,13 +11,18 @@ import { reserveAiRequest, releaseAiRequest, reserveDraft, releaseDraft } from '
 
 const DEFAULT_MODEL = 'gemini-3.8-flash';
 const UPSTREAM_TIMEOUT_MS = 80000;
+/** Longest a client may ask the server to wait on Gemini (needs keep-alive bytes to survive the edge). */
+const MAX_WAIT_MS = 170000;
+/** Beyond this, bytes must keep flowing or Render's edge drops the connection at ~100s. */
+const KEEPALIVE_ABOVE_MS = 70000;
+const HEARTBEAT_MS = 10000;
 /** A retry is only worth it when the first try failed fast (overload, reset). */
 const RETRY_ONLY_IF_FASTER_THAN_MS = 20000;
 
 const cors = (res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Id, X-Work-Kind');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Id, X-Work-Kind, X-Keepalive, X-Max-Wait-Ms');
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -99,7 +104,7 @@ const toSdkContents = (contents) => {
   return [{ role: 'user', parts: list.map(toSdkParts) }];
 };
 
-const toSdkConfig = (config, model) => {
+const toSdkConfig = (config, model, waitMs = UPSTREAM_TIMEOUT_MS) => {
   const out = {};
   const instruction = config?.systemInstruction;
   if (instruction) {
@@ -120,9 +125,7 @@ const toSdkConfig = (config, model) => {
       ? { thinkingLevel: think.thinkingLevel || budgetToLevel(think.thinkingBudget) }
       : think;
   }
-  // Render's edge cuts a request off near 100s, so every Gemini call must give
-  // up before then and let the app split the work instead of dying silently.
-  out.httpOptions = { timeout: UPSTREAM_TIMEOUT_MS };
+  out.httpOptions = { timeout: waitMs };
   return out;
 };
 
@@ -214,10 +217,38 @@ export async function geminiHandler(req, res) {
     }
   }
 
+  // A client that is willing to wait longer says so; short calls stay short so
+  // the edge never cuts them off. Long calls send a space every few seconds,
+  // which keeps the connection alive past Render's ~100s idle limit.
+  const askedWait = Number(req.headers['x-max-wait-ms']);
+  const waitMs = Number.isFinite(askedWait)
+    ? Math.min(MAX_WAIT_MS, Math.max(10000, askedWait))
+    : UPSTREAM_TIMEOUT_MS;
+  const keepAlive = req.headers['x-keepalive'] === '1' && waitMs > KEEPALIVE_ABOVE_MS;
+  let heartbeat = null;
+  if (keepAlive) {
+    res.status(200);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    heartbeat = setInterval(() => { if (!res.writableEnded) res.write(' '); }, HEARTBEAT_MS);
+    res.on('close', () => clearInterval(heartbeat));
+  }
+  // Once the 200 header is out, an error has to travel inside the body.
+  const reply = (status, payload) => {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      if (!res.writableEnded) res.end(JSON.stringify(status === 200 ? payload : { ...payload, status }));
+      return;
+    }
+    res.status(status).json(payload);
+  };
+
   const request = {
     model,
     contents: toSdkContents(contents),
-    config: toSdkConfig(req.body?.config, model),
+    config: toSdkConfig(req.body?.config, model, waitMs),
   };
 
   let lastStatus = 502;
@@ -228,7 +259,7 @@ export async function geminiHandler(req, res) {
     const startedAt = Date.now();
     try {
       const response = await ai.models.generateContent(request);
-      return res.status(200).json({
+      return reply(200, {
         text: extractText(response),
         sources: extractSources(response),
       });
@@ -251,12 +282,12 @@ export async function geminiHandler(req, res) {
 
   console.error('[gemini] upstream failed:', lastStatus, String(lastMessage).slice(0, 180));
   if (timedOut) {
-    return res.status(504).json({
+    return reply(504, {
       error: 'GEMINI_TIMEOUT',
       message: 'The AI took too long on this request.',
     });
   }
-  return res.status(lastStatus >= 400 ? lastStatus : 502).json({
+  return reply(lastStatus >= 400 ? lastStatus : 502, {
     error: 'GEMINI_FAILED',
     message: lastMessage.slice(0, 180),
   });
