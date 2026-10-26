@@ -10,6 +10,9 @@ import { verifyRequestUser } from '../lib/authUser.js';
 import { reserveAiRequest, releaseAiRequest, reserveDraft, releaseDraft } from '../lib/usageGuard.js';
 
 const DEFAULT_MODEL = 'gemini-3.8-flash';
+const UPSTREAM_TIMEOUT_MS = 80000;
+/** A retry is only worth it when the first try failed fast (overload, reset). */
+const RETRY_ONLY_IF_FASTER_THAN_MS = 20000;
 
 const cors = (res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -37,7 +40,14 @@ const getClient = () => {
 const errStatus = (err) =>
   Number(err?.status || err?.code || err?.response?.status || 0);
 
+const isTimeoutError = (err) =>
+  err?.name === 'TimeoutError'
+  || errStatus(err) === 408
+  || errStatus(err) === 504
+  || /timed? ?out|deadline|aborted/i.test(String(err?.message || ''));
+
 const isRetryableError = (err) => {
+  if (isTimeoutError(err)) return false;
   const status = errStatus(err);
   if (status === 429 || status === 500 || status === 503) return true;
   return /overloaded|unavailable|timeout|deadline|ECONNRESET|fetch failed/i.test(
@@ -110,7 +120,9 @@ const toSdkConfig = (config, model) => {
       ? { thinkingLevel: think.thinkingLevel || budgetToLevel(think.thinkingBudget) }
       : think;
   }
-  out.httpOptions = { timeout: 90000 };
+  // Render's edge cuts a request off near 100s, so every Gemini call must give
+  // up before then and let the app split the work instead of dying silently.
+  out.httpOptions = { timeout: UPSTREAM_TIMEOUT_MS };
   return out;
 };
 
@@ -211,7 +223,9 @@ export async function geminiHandler(req, res) {
   let lastStatus = 502;
   let lastMessage = 'Gemini request failed';
 
+  let timedOut = false;
   for (let attempt = 0; attempt < 2; attempt++) {
+    const startedAt = Date.now();
     try {
       const response = await ai.models.generateContent(request);
       return res.status(200).json({
@@ -221,7 +235,9 @@ export async function geminiHandler(req, res) {
     } catch (err) {
       lastStatus = errStatus(err) || 502;
       lastMessage = String(err?.message || 'Gemini request failed');
-      if (!isRetryableError(err) || attempt === 1) break;
+      timedOut = isTimeoutError(err);
+      const fastFailure = Date.now() - startedAt < RETRY_ONLY_IF_FASTER_THAN_MS;
+      if (!isRetryableError(err) || attempt === 1 || !fastFailure) break;
       await sleep(500 * (attempt + 1));
     }
   }
@@ -234,6 +250,12 @@ export async function geminiHandler(req, res) {
   }
 
   console.error('[gemini] upstream failed:', lastStatus, String(lastMessage).slice(0, 180));
+  if (timedOut) {
+    return res.status(504).json({
+      error: 'GEMINI_TIMEOUT',
+      message: 'The AI took too long on this request.',
+    });
+  }
   return res.status(lastStatus >= 400 ? lastStatus : 502).json({
     error: 'GEMINI_FAILED',
     message: lastMessage.slice(0, 180),
