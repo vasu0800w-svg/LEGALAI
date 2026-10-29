@@ -11,7 +11,7 @@ import fetch from 'node-fetch';
 import rateLimit from 'express-rate-limit';
 import { WebSocketServer, WebSocket } from 'ws';
 import { validateChatLimitsMiddleware, getPlanLimits } from './middleware/planLimits.js';
-import { createOrderHandler, verifyPaymentHandler, razorpayOptionsHandler, resolveRazorpayKeys } from './routes/razorpay.js';
+import { createOrderHandler, verifyPaymentHandler, razorpayOptionsHandler } from './routes/razorpay.js';
 import { geminiHandler, geminiOptionsHandler } from './routes/gemini.js';
 import { verificationLinkHandler, verificationLinkOptionsHandler } from './routes/verificationLink.js';
 import { redeemPromoHandler, promoStatusHandler, promoOptionsHandler } from './routes/promo.js';
@@ -27,10 +27,16 @@ import {
   customPlanQuoteHandler,
 } from './routes/customPlan.js';
 import { attachAuthUser } from './lib/authUser.js';
-import { adminReady } from './lib/firebaseAdmin.js';
+import { applyCors, applySecurityHeaders } from './lib/httpSecurity.js';
+import { requireAdmin } from './lib/adminAuth.js';
 
 const app = express();
+app.disable('x-powered-by');
 app.use(express.json({limit: process?.env?.API_PAYLOAD_MAX_SIZE || "20mb"}));
+app.use((req, res, next) => {
+  applySecurityHeaders(req, res);
+  next();
+});
 
 // Render sets PORT; bind 0.0.0.0 so the service is reachable publicly
 const PORT = Number(process?.env?.PORT || process?.env?.API_BACKEND_PORT || 5000);
@@ -50,25 +56,26 @@ if (!vertexEnabled) {
 app.set('trust proxy', 1 /* number of proxies between user and server */);
 
 // Health check for Render
-app.get('/', async (_req, res) => {
-  let razorpayMode = 'missing';
-  try {
-    razorpayMode = (await resolveRazorpayKeys()).mode;
-  } catch {
-    razorpayMode = 'missing';
-  }
+app.get('/', (_req, res) => {
   res.status(200).json({
     ok: true,
     service: 'casemate-api',
-    razorpay: razorpayMode !== 'missing',
-    razorpayMode,
-    gemini: Boolean(process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY),
-    firebaseAdmin: adminReady(),
-    vertexProxy: vertexEnabled,
   });
 });
 
 app.get('/health', (_req, res) => {
+  res.status(200).json({ ok: true });
+});
+
+app.options('/api/admin/session', (req, res) => {
+  applyCors(req, res, 'GET, OPTIONS');
+  res.status(204).end();
+});
+
+app.get('/api/admin/session', attachAuthUser, async (req, res) => {
+  applyCors(req, res, 'GET, OPTIONS');
+  const user = await requireAdmin(req, res);
+  if (!user) return;
   res.status(200).json({ ok: true });
 });
 
@@ -92,8 +99,7 @@ if (vertexEnabled) {
 
 // Validate plan-wise message / session character limits for the signed-in user.
 app.post('/api/validate-chat-limits', attachAuthUser, (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  applyCors(req, res, 'POST, OPTIONS');
   validateChatLimitsMiddleware(req, res, () => {
     res.status(200).json({
       ok: true,
@@ -102,10 +108,8 @@ app.post('/api/validate-chat-limits', attachAuthUser, (req, res) => {
   });
 });
 
-app.options('/api/validate-chat-limits', (_req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+app.options('/api/validate-chat-limits', (req, res) => {
+  applyCors(req, res, 'POST, OPTIONS');
   res.status(204).end();
 });
 
@@ -468,14 +472,12 @@ app.post('/api-proxy', async (req, res) => {
   } catch (error) {
     console.error(`[Node Proxy] Error proxying request for ${apiClient.name}`);
     console.error(error)
-    res.status(500).json({ error: error });
+    res.status(500).json({ error: 'Proxy failed.' });
   }
 });
 
 const server = app.listen(PORT, API_BACKEND_HOST, () => {
-  console.log(`casemate-api listening on http://${API_BACKEND_HOST}:${PORT}`);
-  console.log(`  Razorpay: ${process.env.RAZORPAY_KEY_ID ? 'configured' : 'NOT configured'}`);
-  console.log(`  Vertex proxy: ${vertexEnabled ? 'enabled' : 'disabled'}`);
+  console.log(`casemate-api listening on port ${PORT}`);
 });
 
 
@@ -485,7 +487,11 @@ server.on('upgrade', async (request, socket, head) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
 
   if (url.pathname === '/ws-proxy') {
-    
+    if (!vertexEnabled || url.searchParams.get('proxy') !== PROXY_HEADER) {
+      socket.destroy();
+      return;
+    }
+
     let targetUrl = url.searchParams.get('target');
     if (!targetUrl) {
       console.log('[Node Proxy] Missing target URL');

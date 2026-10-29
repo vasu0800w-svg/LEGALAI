@@ -1,21 +1,34 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from 'react';
 import { createPortal } from 'react-dom';
 import { useAppContext } from '../context/AppContext';
-import { generateLegalResponse, distillCaseLearning, cleanChatReply, isUserAbortError } from '../services/geminiService';
+import { generateLegalResponse, distillCaseLearning, cleanChatReply, isUserAbortError, userAskedForSummary, analysisUploadPrompt, ANALYSIS_ACTIONS, warmBackend } from '../services/geminiService';
 import { buildLearnedStylePrompt, loadCommunityStyles, rememberUserStyle } from '../services/styleLearningService';
-import { prepareFilesForAi, uploadPreparedAttachments } from '../services/chatMediaService';
+import { prepareFilesForAi, uploadPreparedAttachments, validateUploadFile } from '../services/chatMediaService';
 import { Attachment } from '../types';
 import { PaperclipIcon, TemplateIcon, SendIcon, SparklesIcon, XIcon, UserIcon, MenuIcon, MicIcon, DocxIcon, PdfIcon, EditIcon, SearchIcon, PlusIcon, CopyIcon, ShareIcon, StopIcon, CheckIcon } from './Icons';
 import { BrandLogo } from './BrandLogo';
 import { Message } from '../types';
 import { translations } from '../utils/translations';
 import { PREDEFINED_TEMPLATES } from '../utils/templates';
+import { JUDGEMENT_TEMPLATES, JUDGEMENT_TEMPLATE_OPTIONS } from '../utils/judgementTemplates';
+import { ADVOCATE_CATALOGUE_OPTIONS, catalogueTemplateContent } from '../utils/advocateCatalogue';
+import { templateLabel } from '../utils/templateLabels';
 import { Document, Packer, Paragraph, TextRun, AlignmentType, Table, TableRow, TableCell, WidthType, BorderStyle } from 'docx';
 import { saveBlobFile, sharePlainText } from '../utils/nativeDownload';
+import { saveFilledTemplate, getFilledTemplate, plainForCompare } from '../utils/filledTemplateStore';
+import { saveScanDraft, getScanDraft, getProfile } from '../utils/scanProfileStore';
+import { ScanTemplateCheck } from './ScanTemplateCheck';
 import { Capacitor } from '@capacitor/core';
-import { getPlanLimits, validateChatCharacterLimits, isUnlimitedEmail } from '../utils/planLimits';
+import { getPlanLimits, validateChatCharacterLimits, hasUnlimitedAccess, validatePhotoLimit, countCasePhotos, nextIstMidnightLabel, getSessionCharCount, chatLimitProximity } from '../utils/planLimits';
+import { IncreaseChatLimitModal } from './IncreaseChatLimitModal';
+import { validateChatLimits } from '../services/entitlementsService';
 import { pickMultipleNativeFiles, isNativeApp } from '../utils/pickFiles';
 import { registerDocumentEditorCloser } from '../utils/nativeNavigation';
+import { chatDayKey, chatStartedAt, formatChatDay, formatChatTime, parseClientFromEvidence } from '../utils/chatLabel';
+import { languageLocale } from '../utils/languages';
+import { beginBackgroundWork, endBackgroundWork } from '../services/backgroundWork';
+import { isAndroidSpeechPlatform, nativeSpeechAvailable, startNativeSpeech, stopNativeSpeech } from '../services/speechListen';
+import { FreeUsageStrip } from './UsageMeter';
 
 // Helper to escape HTML to prevent XSS before parsing custom tags
 const escapeHTML = (str: string) => str.replace(/[&<>'"]/g, 
@@ -805,7 +818,7 @@ const pageBlockFromCaret = (page: HTMLElement): HTMLElement | null => {
     return kids[Math.min(range.startOffset, Math.max(0, kids.length - 1))] || kids[0];
   }
   while (node && node !== page) {
-    const parent = node.parentElement;
+    const parent: HTMLElement | null = node.parentElement;
     if (parent === page && node instanceof HTMLElement) return node;
     node = parent;
   }
@@ -1116,6 +1129,8 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
   const [matchIndex, setMatchIndex] = useState(0);
   const [matchCount, setMatchCount] = useState(0);
   const [activeSplitCell, setActiveSplitCell] = useState<'left' | 'center' | 'right' | null>(null);
+  const [hasScanDraft, setHasScanDraft] = useState(false);
+  const [scanCheckOpen, setScanCheckOpen] = useState(false);
   const findInputRef = useRef<HTMLInputElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
@@ -1221,6 +1236,14 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
   useEffect(() => {
     if (!isEditing) lastGoodTextRef.current = msg.text;
   }, [msg.text, isEditing]);
+
+  useEffect(() => {
+    let dead = false;
+    void getScanDraft(msg.id).then((rec) => {
+      if (!dead) setHasScanDraft(!!rec);
+    });
+    return () => { dead = true; };
+  }, [msg.id]);
 
   useEffect(() => {
     zoomLevelRef.current = zoomLevel;
@@ -1652,10 +1675,6 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
   };
 
   const startEditing = () => {
-    if (isTimeUp) {
-      setIsUpgradeModalOpen(true);
-      return;
-    }
     setZoomLevel(1);
     ensureParagraphSeparator();
     editOriginalRef.current = msg.text;
@@ -2144,14 +2163,9 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
   };
 
   const splitHint = (cell: 'left' | 'center' | 'right') => {
-    if (language === 'Hindi') {
-      if (cell === 'left') return 'बाएँ';
-      if (cell === 'center') return 'मध्य';
-      return 'दाएँ';
-    }
-    if (cell === 'left') return 'Left';
-    if (cell === 'center') return 'Centre';
-    return 'Right';
+    if (cell === 'left') return t.lineSlotLeft || 'Left';
+    if (cell === 'center') return t.lineSlotCenter || 'Centre';
+    return t.lineSlotRight || 'Right';
   };
 
   const syncSplitHints = (root: HTMLElement | null = editorRef.current) => {
@@ -2396,8 +2410,52 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
     });
   };
 
+  const createDownloadVeil = (heading: string, hint: string) => {
+    const veil = document.createElement('div');
+    veil.className = 'casemate-pdf-veil';
+    veil.innerHTML =
+      `<div class="casemate-pdf-card">` +
+      `<div class="casemate-pdf-spinner"></div>` +
+      `<div style="font-family:'Cormorant Garamond',Georgia,serif;font-size:28px;letter-spacing:0.08em;color:#f5f5f5;margin-bottom:8px;">casemate</div>` +
+      `<div style="font-size:15px;font-weight:600;color:#f5f5f5;">${heading}</div>` +
+      `<div style="font-size:12px;color:#8a8a8a;margin-top:6px;">${hint}</div>` +
+      `</div>`;
+    return veil;
+  };
+
   const downloadDocx = async () => {
+    // A draft made by filling the advocate's own Word template is exported from that template's file,
+    // so its tables, headers, footers, logos, numbering and page breaks are exactly the original's.
     try {
+      const stored = await getFilledTemplate(msg.id);
+      if (stored) {
+        const edited = plainForCompare(msg.text) !== plainForCompare(stored.baseText);
+        const keepEdits = edited && window.confirm(
+          'You edited this draft after it was generated.\n\n' +
+          'OK = download your edited text (rebuilt in the editor layout; your template\'s own formatting is NOT applied).\n' +
+          'Cancel = download the template-exact file without your edits.\n\n' +
+          'आपने ड्राफ्ट बदला है। OK = आपका बदला हुआ टेक्स्ट (एडिटर लेआउट में, टेम्पलेट का फ़ॉर्मेट नहीं)। Cancel = टेम्पलेट का हूबहू फ़ॉर्मेट, बिना आपके बदलावों के।'
+        );
+        if (!keepEdits) {
+          const copy = new Uint8Array(stored.docx);
+          await saveBlobFile(
+            new Blob([copy], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
+            `${title.replace(/\s+/g, '_')}.docx`
+          );
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn('Could not use the stored template file; exporting from the editor text', e);
+    }
+    const screen = document.createElement('div');
+    screen.setAttribute('aria-hidden', 'true');
+    screen.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:#0a0a0a;';
+    screen.appendChild(createDownloadVeil(t.preparingDocx, t.preparingPdfHint));
+    document.body.appendChild(screen);
+    const shownAt = performance.now();
+    try {
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
       const paragraphs: any[] = [];
       // Content width in DXA (twips) based on page size width minus equal margins
       const PAGE_CONTENT_WIDTH = Math.max(1440, 12240 - marginLeftTwips - marginRightTwips);
@@ -2567,6 +2625,10 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
     } catch (error) {
       console.error("Error generating DOCX:", error);
       alert("Failed to generate DOCX file.");
+    } finally {
+      const remain = 450 - (performance.now() - shownAt);
+      if (remain > 0) await new Promise((r) => window.setTimeout(r, remain));
+      screen.remove();
     }
   };
 
@@ -2576,6 +2638,64 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
     if (!html2canvas || !JsPDF) {
       alert("PDF generation library is still loading. Please try again in a moment.");
       return;
+    }
+
+    const filename = `${title.replace(/\s+/g, '_')}.pdf`;
+    try {
+      const stored = await getScanDraft(msg.id);
+      if (stored) {
+        const edited = plainForCompare(msg.text) !== plainForCompare(stored.baseText);
+        const keepEdits = edited && window.confirm(
+          'You edited this draft after it was generated.\n\n' +
+          'OK = PDF from the editor view (your edits; template layout is NOT applied).\n' +
+          'Cancel = PDF from the scanned-template reconstruction, without your edits.\n\n' +
+          'आपने ड्राफ्ट बदला है। OK = एडिटर व्यू (आपके बदलाव)। Cancel = स्कैन टेम्पलेट से बना PDF, बिना आपके बदलावों के।'
+        );
+        if (!keepEdits) {
+          const profile = await getProfile(stored.profileId);
+          if (profile) {
+            const stage = document.createElement('div');
+            stage.setAttribute('aria-hidden', 'true');
+            stage.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:#0a0a0a;overflow:hidden;';
+            stage.appendChild(createDownloadVeil(t.preparingPdf, t.preparingPdfHint));
+            document.body.appendChild(stage);
+            try {
+              const { exportScanPdf } = await import('../utils/scanExport');
+              const outcome = await exportScanPdf({
+                profile,
+                draft: stored.draft,
+                stage,
+                chooseOriginal: (plan) => {
+                  if (!plan.eligible) return false;
+                  return window.confirm(
+                    'OK = original scan as the page background (text only in the replaced lines). Best for short fills on a form.\n' +
+                    'Cancel = reconstructed flowing pages matching the Word file. Use this for petitions.\n\n' +
+                    'OK = मूल स्कैन पृष्ठ, केवल बदली हुई पंक्तियाँ। Cancel = Word जैसा बहता लेआउट (याचिकाओं के लिए)।'
+                  );
+                },
+              });
+              await saveBlobFile(outcome.blob, filename);
+              const failed = outcome.checks.filter((c) => !c.ok);
+              if (failed.length || outcome.notes.length) {
+                alert(
+                  [
+                    outcome.mode === 'original-layout'
+                      ? (language === 'Hindi' ? 'PDF मूल स्कैन पृष्ठ पर बना है।' : 'PDF used the original scan as the page background.')
+                      : (language === 'Hindi' ? 'PDF बहते पृष्ठों से बना है (टेम्पलेट प्रोफ़ाइल)। मूल से अंतर हो सकता है।' : 'PDF was rebuilt as flowing pages from the template reading. Compare it with your original.'),
+                    ...outcome.notes,
+                    ...failed.map((c) => c.detail),
+                  ].join('\n')
+                );
+              }
+              return;
+            } finally {
+              stage.remove();
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Scanned-template PDF export failed; using the editor view', e);
     }
 
     const pagesHtml = docPages.some((p) => (p || '').replace(/<[^>]+>/g, '').trim())
@@ -2590,7 +2710,6 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
     if (pageSize === 'a4') pdfFormat = 'a4';
     if (pageSize === 'letter') pdfFormat = 'letter';
 
-    const filename = `${title.replace(/\s+/g, '_')}.pdf`;
     const pdfBand = continuedBandPx(fontSize);
     const stage = document.createElement('div');
     stage.setAttribute('aria-hidden', 'true');
@@ -2675,15 +2794,7 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
       page.appendChild(surface);
       mount.appendChild(page);
     });
-    const veil = document.createElement('div');
-    veil.className = 'casemate-pdf-veil';
-    veil.innerHTML =
-      `<div class="casemate-pdf-card">` +
-      `<div class="casemate-pdf-spinner"></div>` +
-      `<div style="font-family:'Cormorant Garamond',Georgia,serif;font-size:28px;letter-spacing:0.08em;color:#f5f5f5;margin-bottom:8px;">casemate</div>` +
-      `<div style="font-size:15px;font-weight:600;color:#f5f5f5;">${t.preparingPdf}</div>` +
-      `<div style="font-size:12px;color:#8a8a8a;margin-top:6px;">${t.preparingPdfHint}</div>` +
-      `</div>`;
+    const veil = createDownloadVeil(t.preparingPdf, t.preparingPdfHint);
     stage.appendChild(mount);
     stage.appendChild(veil);
     document.body.appendChild(stage);
@@ -3148,10 +3259,18 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
           >
             <ShareIcon className="w-3.5 h-3.5" /> {t.share}
           </button>
+          {hasScanDraft && (
+            <button
+              type="button"
+              onClick={() => setScanCheckOpen(true)}
+              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-white text-xs font-medium rounded-lg transition-colors"
+            >
+              <TemplateIcon className="w-3.5 h-3.5" /> {language === 'Hindi' ? 'टेम्पलेट जाँच' : 'Template check'}
+            </button>
+          )}
           <button
             onClick={startEditing}
-            disabled={isTimeUp}
-            className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-white text-xs font-medium rounded-lg transition-colors"
           >
             <EditIcon className="w-3.5 h-3.5" /> {t.edit}
           </button>
@@ -3163,11 +3282,36 @@ const DocumentViewer = memo(({ msg, title, t, onUpdate }: { msg: Message, title:
           </button>
         </div>
       </div>
+      {scanCheckOpen && (
+        <ScanTemplateCheck
+          messageId={msg.id}
+          language={language}
+          onClose={() => setScanCheckOpen(false)}
+        />
+      )}
     </div>
   );
 });
 
 const renderInlineText = (line: string, keyPrefix: string) => {
+  if (/https?:\/\/\S+/.test(line)) {
+    const urlParts = line.split(/(https?:\/\/\S+)/g);
+    return urlParts.map((seg, k) =>
+      /^https?:\/\//.test(seg) ? (
+        <a
+          key={`${keyPrefix}-u${k}`}
+          href={seg}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-sky-400 underline underline-offset-2"
+        >
+          open ↗
+        </a>
+      ) : (
+        <React.Fragment key={`${keyPrefix}-t${k}`}>{renderInlineText(seg, `${keyPrefix}-t${k}`)}</React.Fragment>
+      )
+    );
+  }
   const parts = line.split(/(\*\*[^*]+\*\*)/g);
   return parts.map((part, j) => {
     if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
@@ -3188,7 +3332,7 @@ const formatMessageText = (text: string) => {
         }
         const heading = line.match(/^(#{1,6})\s*(.+)$/);
         if (heading) {
-          return <p key={i} className="text-[15px] font-semibold text-white mt-1">{renderInlineText(heading[2], `${i}`)}</p>;
+          return <p key={i} className="text-[17px] font-semibold text-white mt-1">{renderInlineText(heading[2], `${i}`)}</p>;
         }
         const bullet = line.match(/^\s*[-*•]\s+(.+)$/);
         if (bullet) {
@@ -3240,6 +3384,7 @@ const ChatAction = ({
 type ChatMessageListProps = {
   messages: Message[];
   activeTitle: string;
+  language: string;
   editingId: string | null;
   editDraft: string;
   maxMessageChars: number;
@@ -3255,11 +3400,13 @@ type ChatMessageListProps = {
   onCopy: (id: string, text: string) => void;
   onShare: (text: string) => void;
   onUpdateDocument: (id: string, text: string) => void;
+  onSuggest: (question: string) => void;
 };
 
 const ChatMessageList = memo(function ChatMessageList({
   messages,
   activeTitle,
+  language,
   editingId,
   editDraft,
   maxMessageChars,
@@ -3275,12 +3422,26 @@ const ChatMessageList = memo(function ChatMessageList({
   onCopy,
   onShare,
   onUpdateDocument,
+  onSuggest,
 }: ChatMessageListProps) {
+  let lastDay = '';
   return (
     <>
-      {messages.map((msg) => (
+      {messages.map((msg) => {
+        const day = chatDayKey(msg.timestamp);
+        const showDay = !!day && day !== lastDay;
+        if (day) lastDay = day;
+        const clock = formatChatTime(msg.timestamp, language);
+        return (
+        <div key={msg.id}>
+          {showDay && (
+            <div className="flex justify-center mb-4">
+              <span className="px-3 py-1 rounded-full bg-ink-muted border border-ink-border text-[11px] font-medium text-band-mute">
+                {formatChatDay(msg.timestamp, language)}
+              </span>
+            </div>
+          )}
         <div
-          key={msg.id}
           className={`chat-row flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'} ${msg.isDocument ? '' : 'chat-row-light'}`}
         >
           {msg.role === 'model' && (
@@ -3322,10 +3483,12 @@ const ChatMessageList = memo(function ChatMessageList({
             )}
 
             {msg.text && (
-              <div className={`${msg.isDocument ? 'p-0 sm:p-1 overflow-hidden' : 'px-5 py-3.5'} rounded-2xl text-[15px] leading-relaxed shadow-sm ${
+              <div className={`${msg.isDocument ? 'p-0 sm:p-1 overflow-hidden text-[15px]' : 'px-5 py-3.5'} rounded-2xl leading-relaxed shadow-sm ${
                 msg.role === 'user'
-                  ? 'bg-white text-black rounded-tr-sm'
-                  : 'bg-ink-muted border border-ink-border text-band-dim rounded-tl-sm'
+                  ? 'bg-white text-black rounded-tr-sm text-[15px]'
+                  : msg.isDocument
+                    ? 'bg-ink-muted border border-ink-border text-band-dim rounded-tl-sm'
+                    : 'bg-ink-muted border border-ink-border text-band rounded-tl-sm text-[16.5px] sm:text-[17px] font-medium tracking-[0.01em]'
               }`}>
                 {msg.isDocument ? (
                   <DocumentViewer
@@ -3366,8 +3529,11 @@ const ChatMessageList = memo(function ChatMessageList({
               </div>
             )}
 
-            {editingId !== msg.id && (msg.role === 'model' || (msg.role === 'user' && !isTimeUp)) && (
+            {editingId !== msg.id && (msg.role === 'model' || msg.role === 'user' || clock) && (
               <div className={`flex items-center gap-0.5 mt-1.5 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                {clock && (
+                  <span className={`text-[11px] text-band-mute px-1 ${msg.role === 'user' ? 'order-last' : ''}`}>{clock}</span>
+                )}
                 {msg.role === 'model' && (
                   <>
                     <ChatAction
@@ -3391,6 +3557,26 @@ const ChatMessageList = memo(function ChatMessageList({
                 )}
               </div>
             )}
+            {msg.role === 'model' && (msg.suggestedQuestions?.length || 0) > 0 && (
+              <div className="mt-3 space-y-2">
+                <p className="text-xs font-medium text-band-mute flex items-center gap-1.5 px-0.5">
+                  <span aria-hidden="true">✦</span>
+                  {t.suggestedQuestions || 'Suggested questions'}
+                </p>
+                {msg.suggestedQuestions!.map((question) => (
+                  <button
+                    key={question}
+                    type="button"
+                    disabled={isLoading}
+                    onClick={() => onSuggest(question)}
+                    className="w-full text-left px-3 py-2.5 rounded-xl bg-ink border border-ink-border text-sm text-band hover:bg-white/5 disabled:opacity-50 flex items-start gap-2"
+                  >
+                    <span aria-hidden="true" className="mt-0.5">💡</span>
+                    <span>{question}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {msg.role === 'user' && (
@@ -3399,7 +3585,9 @@ const ChatMessageList = memo(function ChatMessageList({
             </div>
           )}
         </div>
-      ))}
+        </div>
+        );
+      })}
 
       {isLoading && (
         <div className="flex gap-4 justify-start">
@@ -3423,21 +3611,27 @@ const ChatMessageList = memo(function ChatMessageList({
 });
 
 export const ChatArea = memo(function ChatArea() {
-  const { activeSessionId, chatSessions, addMessageToActiveSession, updateMessageText, updateMessageFields, trimMessagesAfter, isTimeUp, language, isSidebarOpen, setIsSidebarOpen, incrementDraftCount, setIsSubscriptionModalOpen, setIsUpgradeModalOpen, user, draftCount, cloudTemplates, caseLearnings, upsertCaseLearning } = useAppContext();
+  const { activeSessionId, setActiveSessionId, chatSessions, addMessageToActiveSession, updateMessageText, updateMessageFields, trimMessagesAfter, nameChatFromClient, isTimeUp, language, isSidebarOpen, setIsSidebarOpen, incrementDraftCount, decrementDraftCount, setIsSubscriptionModalOpen, setIsUpgradeModalOpen, user, draftCount, cloudTemplates, caseLearnings, upsertCaseLearning, userMode } = useAppContext();
+  const [chatLimitOpen, setChatLimitOpen] = useState(false);
+  const [chatLimitReason, setChatLimitReason] = useState<'near' | 'reached'>('near');
   const [inputText, setInputText] = useState('');
   const [caseFiles, setCaseFiles] = useState<File[]>([]);
-  const planLimits = getPlanLimits(user?.plan, user?.email);
+  const planLimits = getPlanLimits(user?.plan, user?.email, user);
   const [formatFiles, setFormatFiles] = useState<File[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [showTemplateMenu, setShowTemplateMenu] = useState(false);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [templateSearchQuery, setTemplateSearchQuery] = useState('');
+  const [openTemplateGroup, setOpenTemplateGroup] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [mediaStatus, setMediaStatus] = useState('');
   const [isListening, setIsListening] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [hideContinueHint, setHideContinueHint] = useState(() => {
+    try { return sessionStorage.getItem('casemate_hide_continue_hint') === '1'; } catch { return false; }
+  });
   const [transferBusy, setTransferBusy] = useState<{
     title: string;
     detail?: string;
@@ -3458,12 +3652,15 @@ export const ChatArea = memo(function ChatArea() {
   const speechBaseTextRef = useRef('');
   const wantListeningRef = useRef(false);
   const sendAbortRef = useRef<AbortController | null>(null);
+  const sendLockRef = useRef(false);
   const [communityStyles, setCommunityStyles] = useState('');
 
   const t = translations[language] || translations['English'];
   const activeSession = chatSessions.find(s => s.id === activeSessionId);
   const messages = activeSession?.messages || [];
-  const isSpeechSupported = typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window);
+  const webSpeechOk = typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window);
+  const [nativeSpeechOk, setNativeSpeechOk] = useState(isAndroidSpeechPlatform());
+  const isSpeechSupported = nativeSpeechOk || webSpeechOk;
 
   const resizeTextarea = () => {
     const el = textareaRef.current;
@@ -3505,10 +3702,18 @@ export const ChatArea = memo(function ChatArea() {
     { id: 'nda', name: t.nda }
   ];
 
-  const templateContentMap: Record<string, string> = { ...PREDEFINED_TEMPLATES };
-  const templateOptions = [...builtInTemplateOptions];
+  // Judges get judgment / order formats; advocates keep the pleading templates.
+  const isJudgeMode = userMode === 'judge';
+  const templateContentMap: Record<string, string> = isJudgeMode
+    ? { ...JUDGEMENT_TEMPLATES }
+    : { ...PREDEFINED_TEMPLATES };
+  const templateOptions: { id: string; name: string; group?: string; collapsible?: boolean }[] = isJudgeMode
+    ? JUDGEMENT_TEMPLATE_OPTIONS.map((o) => ({ ...o }))
+    : [...builtInTemplateOptions];
   for (const ct of cloudTemplates) {
     if (!ct?.id) continue;
+    // Admin-added templates are for advocates unless marked audience: 'judge'.
+    if ((ct.audience === 'judge') !== isJudgeMode) continue;
     templateContentMap[ct.id] = ct.content || '';
     const idx = templateOptions.findIndex((o) => o.id === ct.id);
     if (idx >= 0) {
@@ -3518,14 +3723,52 @@ export const ChatArea = memo(function ChatArea() {
     }
   }
 
-  const filteredTemplates = templateOptions.filter(opt => 
-    opt.name.toLowerCase().includes(templateSearchQuery.toLowerCase())
-  );
+  // Advocates also get the full case-type catalogue (28 practice areas), grouped
+  // and collapsible; its layouts are built only when one is picked.
+  if (!isJudgeMode) templateOptions.push(...ADVOCATE_CATALOGUE_OPTIONS);
+
+  // Menu labels follow the app language (names and practice-area headings).
+  const templateOptionLabel = (opt?: { name: string }) => (opt ? templateLabel(opt.name, language) : '');
+  const templateSearching = templateSearchQuery.trim().length > 0;
+  const templateQuery = templateSearchQuery.trim().toLowerCase();
+  const filteredTemplates = showTemplateMenu
+    ? templateOptions.filter(opt =>
+        opt.name.toLowerCase().includes(templateQuery) ||
+        templateOptionLabel(opt).toLowerCase().includes(templateQuery) ||
+        (templateSearching && !!opt.collapsible && !!opt.group && (
+          opt.group.toLowerCase().includes(templateQuery) ||
+          templateLabel(opt.group, language).toLowerCase().includes(templateQuery)
+        ))
+      )
+    : [];
+  const templateGroupCounts: Record<string, number> = {};
+  for (const opt of filteredTemplates) {
+    if (opt.collapsible && opt.group) templateGroupCounts[opt.group] = (templateGroupCounts[opt.group] || 0) + 1;
+  }
 
   useEffect(() => {
     stickToBottomRef.current = true;
     lastMessageIdRef.current = null;
+    setCaseFiles([]);
+    setFormatFiles([]);
+    setSelectedTemplateId(null);
+    setInputText('');
+    setShowAttachMenu(false);
+    setShowTemplateMenu(false);
+    setTemplateSearchQuery('');
+    setEditingId(null);
+    setEditDraft('');
+    if (caseFileInputRef.current) caseFileInputRef.current.value = '';
+    if (caseCameraInputRef.current) caseCameraInputRef.current.value = '';
+    if (formatFileInputRef.current) formatFileInputRef.current.value = '';
+    if (formatCameraInputRef.current) formatCameraInputRef.current.value = '';
   }, [activeSessionId]);
+
+  // A template chosen under one mode must not carry over to the other.
+  useEffect(() => {
+    setSelectedTemplateId(null);
+    setTemplateSearchQuery('');
+  }, [userMode]);
 
   useEffect(() => {
     const lastId = messages[messages.length - 1]?.id ?? null;
@@ -3540,14 +3783,24 @@ export const ChatArea = memo(function ChatArea() {
   }, [messages]);
 
   useEffect(() => {
-    if (!isSpeechSupported) return;
+    if (!isAndroidSpeechPlatform()) return;
+    void nativeSpeechAvailable().then(setNativeSpeechOk);
+    return () => {
+      wantListeningRef.current = false;
+      void stopNativeSpeech();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isAndroidSpeechPlatform()) return;
+    if (!webSpeechOk) return;
 
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     const recognition = new SpeechRecognition();
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
-    recognition.lang = language === 'Hindi' ? 'hi-IN' : 'en-US';
+    recognition.lang = languageLocale(language);
 
     recognition.onresult = (event: any) => {
       let interim = '';
@@ -3573,7 +3826,7 @@ export const ChatArea = memo(function ChatArea() {
     recognition.onerror = (event: any) => {
       const err = event?.error;
       // Transient / expected — keep listening when user still wants it
-      if (err === 'no-speech' || err === 'aborted') return;
+      if (err === 'no-speech' || err === 'aborted' || err === 'audio-capture') return;
       console.error('Speech recognition error', err);
       if (err === 'not-allowed' || err === 'service-not-allowed') {
         wantListeningRef.current = false;
@@ -3581,20 +3834,29 @@ export const ChatArea = memo(function ChatArea() {
         alert('Microphone access is blocked. Please allow mic permission and try again.');
         return;
       }
-      // network / audio-capture etc. — stop cleanly
-      wantListeningRef.current = false;
+      if (wantListeningRef.current) {
+        try {
+          recognition.start();
+        } catch {
+          /* Chrome restarts on onend */
+        }
+        return;
+      }
       setIsListening(false);
     };
 
     recognition.onend = () => {
       // Chrome often stops after a pause; auto-restart while mic is on
       if (wantListeningRef.current) {
-        try {
-          recognition.start();
-        } catch {
-          wantListeningRef.current = false;
-          setIsListening(false);
-        }
+        window.setTimeout(() => {
+          if (!wantListeningRef.current) return;
+          try {
+            recognition.start();
+          } catch {
+            wantListeningRef.current = false;
+            setIsListening(false);
+          }
+        }, 120);
       } else {
         setIsListening(false);
       }
@@ -3613,45 +3875,102 @@ export const ChatArea = memo(function ChatArea() {
       }
       recognitionRef.current = null;
     };
-  }, [isSpeechSupported, language]);
+  }, [webSpeechOk, language]);
 
-  const toggleListening = () => {
-    const recognition = recognitionRef.current;
-    if (!recognition) return;
+  const applyNativeTranscript = (text: string, isFinal: boolean) => {
+    const piece = (text || '').trim();
+    if (!piece) return;
+    if (isFinal) {
+      const base = speechBaseTextRef.current;
+      const needsSpace = base.length > 0 && !/\s$/.test(base);
+      speechBaseTextRef.current = base + (needsSpace ? ' ' : '') + piece + ' ';
+      setInputText(speechBaseTextRef.current);
+      return;
+    }
+    setInputText(speechBaseTextRef.current + piece);
+  };
 
+  const toggleListening = async () => {
     if (isListening || wantListeningRef.current) {
       wantListeningRef.current = false;
-      try {
-        recognition.stop();
-      } catch {
-        /* ignore */
+      if (isAndroidSpeechPlatform()) {
+        try { await stopNativeSpeech(); } catch { /* ignore */ }
+      } else {
+        try { recognitionRef.current?.stop(); } catch { /* ignore */ }
       }
       setIsListening(false);
-      // Keep any interim text that was already shown
       speechBaseTextRef.current = inputText;
       return;
     }
 
     speechBaseTextRef.current = inputText;
-    recognition.lang = language === 'Hindi' ? 'hi-IN' : 'en-US';
     wantListeningRef.current = true;
+
+    if (isAndroidSpeechPlatform()) {
+      setIsListening(true);
+      try {
+        await startNativeSpeech({
+          language: languageLocale(language),
+          onResult: applyNativeTranscript,
+          onError: (err) => {
+            if (!wantListeningRef.current) return;
+            if (err === '7' || err === '6' || err === '5' || err === '8') return;
+            if (err === '9' || err === 'unavailable') {
+              wantListeningRef.current = false;
+              setIsListening(false);
+              alert('Microphone access is blocked. Please allow mic permission and try again.');
+              void stopNativeSpeech();
+            }
+          },
+        });
+      } catch (e) {
+        console.error(e);
+        wantListeningRef.current = false;
+        setIsListening(false);
+        alert('Microphone access is blocked. Please allow mic permission and try again.');
+      }
+      return;
+    }
+
+    const recognition = recognitionRef.current;
+    if (!recognition) {
+      wantListeningRef.current = false;
+      return;
+    }
+    recognition.lang = languageLocale(language);
     try {
+      if (navigator.mediaDevices?.getUserMedia) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      }
       recognition.start();
       setIsListening(true);
     } catch (e) {
       console.error(e);
       wantListeningRef.current = false;
       setIsListening(false);
+      alert('Microphone access is blocked. Please allow mic permission and try again.');
     }
   };
 
   /** Normalize camera/gallery picks so each photo keeps a unique name and always appends */
   const appendIncomingFiles = (incoming: FileList | File[], setFiles: React.Dispatch<React.SetStateAction<File[]>>) => {
-    const list = Array.from(incoming).filter((f) => f && f.size > 0);
+    const picked = Array.from(incoming).filter(Boolean);
+    const problems: string[] = [];
+    const list = picked.filter((f) => {
+      const problem = validateUploadFile(f, language);
+      if (problem) problems.push(problem);
+      return !problem;
+    });
+    if (problems.length > 0) alert(problems.join('\n'));
     if (list.length === 0) {
-      alert(language === 'Hindi' ? 'फ़ाइल पढ़ी नहीं जा सकी। कृपया फिर चुनें।' : 'Could not read files. Please pick again.');
+      if (problems.length === 0) {
+        alert(language === 'Hindi' ? 'फ़ाइल पढ़ी नहीं जा सकी। कृपया फिर चुनें।' : 'Could not read files. Please pick again.');
+      }
       return;
     }
+    // Wake the server now (it sleeps when idle) so the analysis does not pay for the cold start.
+    void warmBackend();
     const stamped = list.map((file, idx) => {
       const isImage = file.type.startsWith('image/') || /\.(jpe?g|png|gif|webp|heic)$/i.test(file.name);
       if (!isImage) return file;
@@ -3678,7 +3997,7 @@ export const ChatArea = memo(function ChatArea() {
   };
 
   const openCaseFilePicker = async () => {
-    if (isTimeUp || transferBusy) return;
+    if (transferBusy) return;
     if (isNativeApp()) {
       setTransferBusy({
         title: language === 'Hindi' ? 'गैलरी खुल रही है…' : 'Opening gallery…',
@@ -3707,12 +4026,11 @@ export const ChatArea = memo(function ChatArea() {
   };
 
   const openCaseCamera = () => {
-    if (isTimeUp) return;
     caseCameraInputRef.current?.click();
   };
 
   const openFormatFilePicker = async () => {
-    if (isTimeUp || transferBusy) return;
+    if (transferBusy) return;
     if (isNativeApp()) {
       setTransferBusy({
         title: language === 'Hindi' ? 'गैलरी खुल रही है…' : 'Opening gallery…',
@@ -3744,7 +4062,6 @@ export const ChatArea = memo(function ChatArea() {
   };
 
   const openFormatCamera = () => {
-    if (isTimeUp) return;
     formatCameraInputRef.current?.click();
   };
 
@@ -3764,7 +4081,11 @@ export const ChatArea = memo(function ChatArea() {
   };
 
   const abortInFlight = () => {
+    sendLockRef.current = false;
     sendAbortRef.current?.abort();
+    setIsLoading(false);
+    setMediaStatus('');
+    setTransferBusy(null);
   };
 
   const copyReply = useCallback(async (id: string, text: string) => {
@@ -3787,14 +4108,13 @@ export const ChatArea = memo(function ChatArea() {
   }, []);
 
   const startEditMessage = useCallback((msg: Message) => {
-    if (isTimeUp) return;
     abortInFlight();
     setEditingId(msg.id);
     setEditDraft(msg.text);
-  }, [isTimeUp]);
+  }, []);
 
-  const handleSend = async (isGenerate: boolean) => {
-    const hasFilesOrTemplate = caseFiles.length > 0 || formatFiles.length > 0 || selectedTemplateId !== null;
+  const handleSend = async (isGenerate: boolean, presetText?: string) => {
+    const hasFilesOrTemplate = presetText ? false : caseFiles.length > 0 || formatFiles.length > 0 || selectedTemplateId !== null;
     const uploadedNow = [...caseFiles, ...formatFiles];
     const onlyDocUploads =
       uploadedNow.length > 0 &&
@@ -3804,8 +4124,9 @@ export const ChatArea = memo(function ChatArea() {
         )
       );
     const mixingCaseAndFormat = caseFiles.length > 0 && (formatFiles.length > 0 || !!selectedTemplateId);
+    const typed = presetText !== undefined ? presetText.trim() : inputText.trim();
     const textToSend =
-      inputText.trim() ||
+      typed ||
       (isGenerate && onlyDocUploads && !mixingCaseAndFormat
         ? (language === 'Hindi'
           ? 'अपलोड की गई फ़ाइल को एडिटर में ज्यों का त्यों डालो। सारांश मत बनाओ। हर पॉइंट वही रखो।'
@@ -3813,49 +4134,63 @@ export const ChatArea = memo(function ChatArea() {
         : isGenerate
         ? "Please generate the document based on the provided context and files."
         : hasFilesOrTemplate
-          ? (language === 'Hindi' ? 'संलग्न फ़ाइलें अपलोड की गईं।' : 'Attached files uploaded.')
+          ? analysisUploadPrompt(language)
           : '');
 
     if (!textToSend && !hasFilesOrTemplate) return;
-    if (isTimeUp || !activeSessionId || isLoading || transferBusy) return;
+    const asDocument = isGenerate && !userAskedForSummary(textToSend);
+    if (!activeSessionId || isLoading || transferBusy || sendLockRef.current) return;
+    sendLockRef.current = true;
 
     // Plan-wise single-message + total session character limits
-    const charCheck = validateChatCharacterLimits(user?.plan, textToSend, messages, user?.email);
+    const charCheck = validateChatCharacterLimits(user?.plan, textToSend, messages, user?.email, user);
     if (!charCheck.ok) {
+      sendLockRef.current = false;
+      if (charCheck.code === 'SESSION_LIMIT') {
+        setChatLimitReason('reached');
+        setChatLimitOpen(true);
+        return;
+      }
       alert(charCheck.error);
       return;
     }
 
-    // Backend validation (best-effort; client check above always applies)
-    try {
-      const res = await fetch('/api/validate-chat-limits', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          plan: user?.plan || 'free',
-          email: user?.email || '',
-          message: textToSend,
-          sessionMessages: messages.map((m) => ({ text: m.text })),
-        }),
-      });
-      if (res.ok === false && res.status === 400) {
-        const data = await res.json().catch(() => null);
-        alert(data?.message || 'Character limit exceeded for your plan. Please start a new chat if the session limit was reached.');
+    const photoCheck = validatePhotoLimit(user?.plan, messages, caseFiles.length, user?.email, user);
+    if (!photoCheck.ok) {
+      sendLockRef.current = false;
+      alert(photoCheck.error);
+      return;
+    }
+
+    const serverCheck = await validateChatLimits({
+      chatId: activeSessionId,
+      message: textToSend,
+      sessionMessages: messages.map((m) => ({ text: m.text })),
+      photoCount: countCasePhotos(messages, caseFiles.length),
+      uploadPhotoCount: caseFiles.length,
+    });
+    if (!serverCheck.ok && !hasUnlimitedAccess(user?.email, user)) {
+      sendLockRef.current = false;
+      if (serverCheck.error === 'SESSION_LIMIT_EXCEEDED') {
+        setChatLimitReason('reached');
+        setChatLimitOpen(true);
         return;
       }
-    } catch {
-      // Backend unavailable — client-side validation already passed
+      alert(serverCheck.message || 'This chat is over the limit for your plan.');
+      return;
     }
 
     // Draft limit check
-    if (isGenerate && !isUnlimitedEmail(user?.email) && draftCount >= planLimits.draftLimit) {
+    if (asDocument && !hasUnlimitedAccess(user?.email, user) && draftCount >= planLimits.draftLimit) {
+      sendLockRef.current = false;
       setIsSubscriptionModalOpen(true);
       return;
     }
 
     // Limit check for document generation
-    if (isGenerate) {
+    if (asDocument) {
       if (!incrementDraftCount()) {
+        sendLockRef.current = false;
         setIsSubscriptionModalOpen(true);
         return;
       }
@@ -3865,12 +4200,14 @@ export const ChatArea = memo(function ChatArea() {
       toggleListening();
     }
 
-    const templateName = selectedTemplateId ? templateOptions.find(t => t.id === selectedTemplateId)?.name : null;
+    const templateName = selectedTemplateId ? templateOptionLabel(templateOptions.find(t => t.id === selectedTemplateId)) : null;
     const msgId = Date.now().toString();
     const currentHistory = [...messages];
     const pendingCaseFiles = [...caseFiles];
     const pendingFormatFiles = [...formatFiles];
-    const currentTemplateContent = selectedTemplateId ? (templateContentMap[selectedTemplateId] || null) : null;
+    const currentTemplateContent = selectedTemplateId
+      ? (templateContentMap[selectedTemplateId] || (!isJudgeMode ? catalogueTemplateContent(selectedTemplateId) : null) || null)
+      : null;
     const sessionId = activeSessionId;
 
     const previewOf = (files: File[], type: 'case' | 'format'): Attachment[] =>
@@ -3888,7 +4225,7 @@ export const ChatArea = memo(function ChatArea() {
     const previewAttachments: Attachment[] = [
       ...previewOf(pendingCaseFiles, 'case'),
       ...previewOf(pendingFormatFiles, 'format'),
-      ...(templateName ? [{ name: `Template: ${templateName}`, type: 'format' as const }] : []),
+      ...(templateName ? [{ name: `${t.templatePrefix}: ${templateName}`, type: 'format' as const }] : []),
     ];
     previewAttachments.forEach((att) => {
       if (att.url?.startsWith('blob:')) previewUrls.push(att.url);
@@ -3907,16 +4244,19 @@ export const ChatArea = memo(function ChatArea() {
 
     stickToBottomRef.current = true;
     addMessageToActiveSession(newUserMsg);
-    setInputText('');
+    if (presetText === undefined) setInputText('');
     speechBaseTextRef.current = '';
     setIsLoading(true);
     setMediaStatus('');
+    const workKind = asDocument ? 'draft' : 'analysis';
+    let workStatus: 'ok' | 'fail' | 'cancel' = 'fail';
 
     setCaseFiles([]);
     setFormatFiles([]);
     setSelectedTemplateId(null);
 
     try {
+      await beginBackgroundWork(workKind, language);
       const savedAttachments: Attachment[] = [];
       const totalFiles = pendingCaseFiles.length + pendingFormatFiles.length;
       let preparedCount = 0;
@@ -3971,7 +4311,7 @@ export const ChatArea = memo(function ChatArea() {
 
       const uploadJob = async () => {
         if (totalFiles === 0) {
-          if (templateName) uploadedAttachments = [{ name: `Template: ${templateName}`, type: 'format' }];
+          if (templateName) uploadedAttachments = [{ name: `${t.templatePrefix}: ${templateName}`, type: 'format' }];
           return;
         }
         setMediaStatus(
@@ -4014,7 +4354,7 @@ export const ChatArea = memo(function ChatArea() {
           const groups = await Promise.all(jobs);
           uploadedAttachments = groups.flat();
           if (templateName) {
-            uploadedAttachments.push({ name: `Template: ${templateName}`, type: 'format' });
+            uploadedAttachments.push({ name: `${t.templatePrefix}: ${templateName}`, type: 'format' });
           }
           if (uploadedAttachments.length > 0) {
             savedAttachments.push(...uploadedAttachments);
@@ -4035,7 +4375,7 @@ export const ChatArea = memo(function ChatArea() {
         caseForAi,
         formatForAi,
         currentTemplateContent,
-        isGenerate,
+        asDocument,
         language,
         ({ phase, batch, totalBatches }) => {
           if (phase === 'analyzing') {
@@ -4055,7 +4395,8 @@ export const ChatArea = memo(function ChatArea() {
           }
         },
         learnedStyleText,
-        ctrl.signal
+        ctrl.signal,
+        userMode
       );
 
       setTransferBusy(null);
@@ -4071,24 +4412,82 @@ export const ChatArea = memo(function ChatArea() {
             : (savedAttachments.length ? savedAttachments : newUserMsg.attachments),
           evidenceNotes: result.evidenceNotes,
         });
+        const hasCasePhoto = pendingCaseFiles.some((f) =>
+          f.type.startsWith('image/') || /\.(jpe?g|png|gif|webp|heic|heif)$/i.test(f.name)
+        );
+        if (hasCasePhoto) {
+          const client = parseClientFromEvidence(result.evidenceNotes);
+          if (client.name || client.caseDate) {
+            nameChatFromClient(sessionId, client.name || '', client.caseDate);
+          }
+        }
       }
 
       const replyFailed =
         !result.text ||
         result.text.startsWith('API Error') ||
-        /The AI is busy|request was too large|Could not generate|सेवा व्यस्त|अनुरोध बहुत बड़ा|उत्तर नहीं बन सका|फ़ोटो पढ़ ली गईं/.test(result.text);
+        /The AI is busy|request was too large|Could not generate|This is taking too long|Network is slow|Photos were read, but|No readable text|पढ़ने योग्य पाठ|सेवा व्यस्त|अनुरोध बहुत बड़ा|उत्तर नहीं बन सका|फ़ोटो पढ़ ली गईं|बहुत समय लग रहा है|नेटवर्क धीमा/.test(result.text);
 
       const newAiMsg: Message = {
         id: (Date.now() + 1).toString(),
         role: 'model',
-        text: isGenerate ? result.text : cleanChatReply(result.text),
+        text: asDocument ? result.text : cleanChatReply(result.text),
         timestamp: Date.now(),
-        isDocument: isGenerate && !replyFailed
+        isDocument: asDocument && !replyFailed,
+        ...(!replyFailed && result.suggestedQuestions?.length
+          ? { suggestedQuestions: result.suggestedQuestions }
+          : {}),
       };
 
       addMessageToActiveSession(newAiMsg);
+      if (!replyFailed && result.filledTemplate) {
+        void saveFilledTemplate(newAiMsg.id, result.filledTemplate.docx, newAiMsg.text, result.filledTemplate.fileName);
+      }
+      if (!replyFailed && result.scanDraft) {
+        void saveScanDraft({
+          id: newAiMsg.id,
+          profileId: result.scanDraft.profile.id,
+          draft: result.scanDraft.draft,
+          docx: result.scanDraft.docx,
+          baseText: newAiMsg.text,
+          fileName: result.scanDraft.fileName,
+          review: result.scanDraft.review,
+          checks: result.scanDraft.checks,
+        });
+      }
+      const scanFailed = (result.scanDraft?.checks || []).filter((c) => !c.ok);
+      const noteLines = [
+        ...(result.notices || []),
+        ...(!replyFailed && result.filledTemplate
+          ? [
+              ...(result.filledTemplate.review.length
+                ? [language === 'Hindi' ? 'कृपया जाँचें:' : 'Please check:', ...result.filledTemplate.review.map((r: string) => `• ${r}`)]
+                : []),
+              ...(scanFailed.length
+                ? scanFailed.map((c) => `⚠ ${c.detail}`)
+                : []),
+              result.scanDraft
+                ? (language === 'Hindi'
+                  ? 'DOCX टेम्पलेट की पढ़ी गई संरचना से बना वास्तविक Word फ़ाइल है, स्कैन की तस्वीर नहीं। PDF याचिकाओं के लिए बहते पृष्ठों से बनता है; छोटे फ़ॉर्म पर मूल स्कैन पृष्ठ चुना जा सकता है। हेडिंग/शैली सुधारने के लिए "टेम्पलेट जाँच" खोलें। मूल से मिलाकर देखें — स्कैन से पूर्ण समानता का दावा नहीं।'
+                  : 'DOCX is a real Word file rebuilt from the template reading, not a picture of the scan. PDF uses flowing pages for petitions; short form fills can keep the original scan as the page. Open "Template check" to correct headings or styles. Compare with your original — this is not claimed to be a perfect visual copy of the scan.')
+                : (language === 'Hindi'
+                  ? 'यह ड्राफ्ट आपके अपने Word टेम्पलेट को सीधे भरकर बना है। हूबहू फ़ॉर्मेट के लिए "Download DOCX" इस्तेमाल करें; PDF एडिटर व्यू से बनता है।'
+                  : 'This draft was made by filling your own Word template in place. Use "Download DOCX" for the exact template formatting; PDF is produced from the editor view.'),
+            ]
+          : []),
+      ];
+      if (noteLines.length > 0) {
+        addMessageToActiveSession({
+          id: (Date.now() + 2).toString(),
+          role: 'model',
+          text: noteLines.join('\n'),
+          timestamp: Date.now() + 1,
+        });
+      }
+      workStatus = replyFailed ? 'fail' : 'ok';
+      if (asDocument && replyFailed) decrementDraftCount();
 
-      if (isGenerate && result.text && !replyFailed) {
+      if (asDocument && result.text && !replyFailed) {
         void rememberUserStyle(result.text, language);
         void (async () => {
           try {
@@ -4109,7 +4508,9 @@ export const ChatArea = memo(function ChatArea() {
         })();
       }
     } catch (err: any) {
+      if (asDocument) decrementDraftCount();
       if (isUserAbortError(err) || ctrl.signal.aborted) {
+        workStatus = 'cancel';
         return;
       }
       console.error(err);
@@ -4126,16 +4527,18 @@ export const ChatArea = memo(function ChatArea() {
       });
     } finally {
       if (sendAbortRef.current === ctrl) sendAbortRef.current = null;
+      sendLockRef.current = false;
       setIsLoading(false);
       setMediaStatus('');
       setTransferBusy(null);
       previewUrls.forEach((url) => URL.revokeObjectURL(url));
+      void endBackgroundWork(workStatus, workKind, language);
     }
   };
 
   const handleSaveEdit = useCallback(async (msg: Message) => {
     const next = editDraft.trim();
-    if (!next || isTimeUp) return;
+    if (!next) return;
     abortInFlight();
     setEditingId(null);
 
@@ -4150,8 +4553,10 @@ export const ChatArea = memo(function ChatArea() {
     setIsLoading(true);
     setMediaStatus(language === 'Hindi' ? 'उत्तर तैयार हो रहा है…' : 'Writing reply…');
     stickToBottomRef.current = true;
+    let workStatus: 'ok' | 'fail' | 'cancel' = 'fail';
 
     try {
+      await beginBackgroundWork('analysis', language);
       const learnedStyleText = buildLearnedStylePrompt(chatSessions, caseLearnings, communityStyles);
       const result = await generateLegalResponse(
         next,
@@ -4176,7 +4581,10 @@ export const ChatArea = memo(function ChatArea() {
         ctrl.signal
       );
 
-      if (ctrl.signal.aborted) return;
+      if (ctrl.signal.aborted) {
+        workStatus = 'cancel';
+        return;
+      }
 
       addMessageToActiveSession({
         id: (Date.now() + 1).toString(),
@@ -4184,9 +4592,14 @@ export const ChatArea = memo(function ChatArea() {
         text: cleanChatReply(result.text),
         timestamp: Date.now(),
         isDocument: false,
+        ...(result.suggestedQuestions?.length ? { suggestedQuestions: result.suggestedQuestions } : {}),
       });
+      workStatus = 'ok';
     } catch (err: any) {
-      if (isUserAbortError(err) || ctrl.signal.aborted) return;
+      if (isUserAbortError(err) || ctrl.signal.aborted) {
+        workStatus = 'cancel';
+        return;
+      }
       addMessageToActiveSession({
         id: (Date.now() + 1).toString(),
         role: 'model',
@@ -4199,6 +4612,7 @@ export const ChatArea = memo(function ChatArea() {
       if (sendAbortRef.current === ctrl) sendAbortRef.current = null;
       setIsLoading(false);
       setMediaStatus('');
+      void endBackgroundWork(workStatus, 'analysis', language);
     }
   }, [editDraft, isTimeUp, messages, language, chatSessions, caseLearnings, communityStyles, updateMessageText, trimMessagesAfter, addMessageToActiveSession]);
 
@@ -4210,10 +4624,10 @@ export const ChatArea = memo(function ChatArea() {
   const onCancelEdit = useCallback(() => setEditingId(null), []);
   const onEditDraft = useCallback((value: string) => setEditDraft(value), []);
 
-  if (!activeSessionId) {
+  if (!activeSessionId || !activeSession) {
     return (
       <div className="flex-1 flex flex-col min-h-0 h-full overflow-hidden app-bottom-glow">
-        <div className="app-safe-top flex items-center p-4 border-b border-ink-border bg-ink-soft text-white flex-shrink-0">
+        <div className="app-safe-top flex items-center p-4 border-b border-ink-border bg-ink-soft text-band flex-shrink-0">
           <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="mr-3 text-band-mute hover:text-white transition-colors">
             <MenuIcon className="w-6 h-6" />
           </button>
@@ -4224,8 +4638,8 @@ export const ChatArea = memo(function ChatArea() {
             <div className="mx-auto mb-5 w-20 h-20 brand-ring flex items-center justify-center animate-mark-reveal">
               <BrandLogo size={72} className="rounded-full" />
             </div>
-            <h2 className="text-2xl font-display font-semibold text-white/70">{t.welcome}</h2>
-            <p className="mt-2 text-white/40">{t.selectCase}</p>
+            <h2 className="text-2xl font-display font-semibold text-band-dim">{t.welcome}</h2>
+            <p className="mt-2 text-band-mute">{t.selectCase}</p>
           </div>
         </div>
       </div>
@@ -4266,8 +4680,11 @@ export const ChatArea = memo(function ChatArea() {
       )}
       {isTimeUp && (
         <div className="app-safe-top bg-amber-950/90 border-b border-amber-700/60 text-amber-100 text-xs sm:text-sm py-2.5 px-4 z-20 flex flex-wrap items-center justify-center gap-2 sm:gap-3 flex-shrink-0">
-          <span className="font-semibold uppercase tracking-wide text-amber-300">Limit over</span>
-          <span className="text-center">{t.limitOverBanner || t.timeLimitDesc}</span>
+          <span className="font-semibold uppercase tracking-wide text-amber-300">{language === 'Hindi' ? 'दैनिक विंडो' : 'Daily window'}</span>
+          <span className="text-center">
+            {t.limitOverBanner
+              || `Today's app-time window is used. You can still open saved cases and continue until the daily AI allowance runs out. Resets at ${nextIstMidnightLabel()}.`}
+          </span>
           <button
             type="button"
             onClick={() => setIsUpgradeModalOpen(true)}
@@ -4278,11 +4695,21 @@ export const ChatArea = memo(function ChatArea() {
         </div>
       )}
 
-      <div className={`${isTimeUp ? '' : 'app-safe-top'} flex items-center p-4 border-b border-ink-border bg-ink-soft text-white shadow-sm z-10 flex-shrink-0`}>
+      <div className={`${isTimeUp ? '' : 'app-safe-top'} flex items-center p-4 border-b border-ink-border bg-ink-soft text-band shadow-sm z-10 flex-shrink-0`}>
         <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="mr-3 text-band-mute hover:text-white transition-colors">
           <MenuIcon className="w-6 h-6" />
         </button>
-        <h1 className="font-semibold text-lg truncate">{activeSession?.title || t.newChat}</h1>
+        <div className="min-w-0 flex-1">
+          <h1 className="font-semibold text-lg truncate">{activeSession?.title || t.newChat}</h1>
+          {activeSession && (
+            <p className="text-xs text-band-mute truncate">
+              {activeSession.caseDate
+                ? `${language === 'Hindi' ? `दिनांक ${activeSession.caseDate}` : activeSession.caseDate} · ${formatChatDay(chatStartedAt(activeSession), language)}`
+                : formatChatDay(chatStartedAt(activeSession), language)}
+            </p>
+          )}
+          <FreeUsageStrip compact />
+        </div>
       </div>
 
       <div
@@ -4303,29 +4730,59 @@ export const ChatArea = memo(function ChatArea() {
             <div className="brand-ring w-20 h-20 flex items-center justify-center animate-mark-reveal">
               <BrandLogo size={72} className="rounded-full" />
             </div>
-            {isTimeUp ? (
-              <>
-                <h3 className="text-xl font-display font-semibold text-band">{t.timeLimitTitle}</h3>
-                <p className="text-sm">{t.limitOverHome || 'Your free daily limit is over. You can still open and read your old chats, but new chats and edits are locked until you upgrade.'}</p>
+            <h3 className="text-xl font-display font-semibold text-band-dim">{t.howCanIAssist}</h3>
+            <p className="text-sm text-band-mute">{t.uploadPrompt}</p>
+            <div className="flex flex-wrap justify-center gap-2 pt-1">
+              {ANALYSIS_ACTIONS(language).map((action) => (
                 <button
+                  key={action.id}
                   type="button"
-                  onClick={() => setIsUpgradeModalOpen(true)}
-                  className="px-4 py-2 rounded-xl bg-white text-black hover:bg-neutral-200 text-sm font-semibold transition-colors"
+                  onClick={() => void handleSend(false, action.prompt)}
+                  className="px-3 py-1.5 rounded-full border border-ink-border bg-ink-muted/70 text-xs text-band hover:bg-ink-muted transition-colors"
                 >
-                  {t.upgradeNow}
+                  {action.label}
                 </button>
-              </>
-            ) : (
-              <>
-                <h3 className="text-xl font-display font-semibold text-white/70">{t.howCanIAssist}</h3>
-              </>
-            )}
+              ))}
+            </div>
+            {!hideContinueHint && (() => {
+              const unfinished = chatSessions.find((s) =>
+                s.id !== activeSessionId && s.messages.some((m) => m.isDocument)
+              );
+              if (!unfinished) return null;
+              return (
+                <div className="w-full rounded-xl border border-ink-border bg-ink-muted/60 px-3 py-2 text-left">
+                  <p className="text-xs text-band-dim">
+                    {language === 'Hindi' ? 'अधूरा ड्राफ्ट' : 'Unfinished draft'}: {unfinished.title}
+                  </p>
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-white underline"
+                      onClick={() => setActiveSessionId(unfinished.id)}
+                    >
+                      {language === 'Hindi' ? 'जारी रखें' : 'Continue'}
+                    </button>
+                    <button
+                      type="button"
+                      className="text-xs text-band-mute"
+                      onClick={() => {
+                        setHideContinueHint(true);
+                        try { sessionStorage.setItem('casemate_hide_continue_hint', '1'); } catch { /* ignore */ }
+                      }}
+                    >
+                      {language === 'Hindi' ? 'छिपाएँ' : 'Hide'}
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         )}
 
         <ChatMessageList
           messages={messages}
           activeTitle={activeSession?.title || 'Legal_Document'}
+          language={language}
           editingId={editingId}
           editDraft={editDraft}
           maxMessageChars={planLimits.maxMessageChars}
@@ -4341,12 +4798,50 @@ export const ChatArea = memo(function ChatArea() {
           onCopy={copyReply}
           onShare={shareReply}
           onUpdateDocument={onUpdateDocument}
+          onSuggest={(question) => void handleSend(false, question)}
         />
         <div ref={messagesEndRef} />
       </div>
 
       <div className="app-safe-bottom px-3 pt-2 bg-transparent flex-shrink-0 relative z-10">
         <div className="max-w-4xl mx-auto">
+          {(() => {
+            const used = getSessionCharCount(messages);
+            const proximity = chatLimitProximity(used, planLimits.maxSessionChars);
+            if (hasUnlimitedAccess(user?.email, user) || proximity === 'ok') return null;
+            return (
+              <div className="mb-2 rounded-xl border border-amber-800/70 bg-amber-950/40 px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-amber-100">
+                  {used.toLocaleString('en-IN')} / {planLimits.maxSessionChars.toLocaleString('en-IN')} characters in this chat.
+                  {proximity === 'reached' ? ' The cap is reached.' : ' This chat is close to its cap.'}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setChatLimitReason(proximity);
+                    setChatLimitOpen(true);
+                  }}
+                  className="text-xs font-bold px-3 py-1.5 rounded-lg bg-amber-400 text-ink"
+                >
+                  Increase Chat Limit
+                </button>
+              </div>
+            );
+          })()}
+          {caseFiles.length > 0 && messages.length > 0 && (
+            <div className="flex flex-wrap gap-2 mb-2">
+              {ANALYSIS_ACTIONS(language).slice(0, 4).map((action) => (
+                <button
+                  key={action.id}
+                  type="button"
+                  onClick={() => void handleSend(false, action.prompt)}
+                  className="px-2.5 py-1 rounded-full border border-sky-800/60 bg-sky-950/40 text-[11px] text-sky-100 hover:bg-sky-900/50"
+                >
+                  {action.label}
+                </button>
+              ))}
+            </div>
+          )}
           {(caseFiles.length > 0 || formatFiles.length > 0 || selectedTemplateId) && (
             <div className="flex flex-wrap gap-2 mb-2 max-h-24 overflow-y-auto custom-scrollbar">
               {caseFiles.map((f, i) => (
@@ -4356,7 +4851,7 @@ export const ChatArea = memo(function ChatArea() {
                   <button onClick={() => removeCaseFile(i)} className="ml-2 hover:text-sky-100 hover:bg-sky-900/50 rounded-full p-0.5 transition-colors flex-shrink-0"><XIcon className="w-3 h-3" /></button>
                 </div>
               ))}
-              {caseFiles.length > 0 && !isTimeUp && (
+              {caseFiles.length > 0 && (
                 <button
                   type="button"
                   onClick={openCaseCamera}
@@ -4373,7 +4868,7 @@ export const ChatArea = memo(function ChatArea() {
                   <button onClick={() => removeFormatFile(i)} className="ml-2 hover:text-amber-100 hover:bg-amber-900/50 rounded-full p-0.5 transition-colors flex-shrink-0"><XIcon className="w-3 h-3" /></button>
                 </div>
               ))}
-              {formatFiles.length > 0 && !isTimeUp && (
+              {formatFiles.length > 0 && (
                 <button
                   type="button"
                   onClick={openFormatCamera}
@@ -4386,7 +4881,7 @@ export const ChatArea = memo(function ChatArea() {
               {selectedTemplateId && (
                 <div className="flex items-center bg-amber-950/50 text-amber-200 text-xs px-3 py-1.5 rounded-lg border border-amber-700/50 shadow-sm">
                   <TemplateIcon className="w-3.5 h-3.5 mr-1.5 flex-shrink-0" />
-                  <span className="truncate max-w-[150px] font-medium">Template: {templateOptions.find(t => t.id === selectedTemplateId)?.name}</span>
+                  <span className="truncate max-w-[150px] font-medium">{t.templatePrefix}: {templateOptionLabel(templateOptions.find(o => o.id === selectedTemplateId))}</span>
                   <button onClick={() => setSelectedTemplateId(null)} className="ml-2 hover:text-amber-100 hover:bg-amber-900/50 rounded-full p-0.5 transition-colors flex-shrink-0"><XIcon className="w-3 h-3" /></button>
                 </div>
               )}
@@ -4402,8 +4897,7 @@ export const ChatArea = memo(function ChatArea() {
                       <button
                         type="button"
                         onClick={() => { void openCaseFilePicker(); setShowAttachMenu(false); setShowTemplateMenu(false); }}
-                        disabled={isTimeUp}
-                        className="flex-1 flex items-center gap-2 px-3 py-2.5 text-sm text-band-dim hover:bg-ink-muted rounded-lg transition-colors disabled:opacity-50"
+                        className="flex-1 flex items-center gap-2 px-3 py-2.5 text-sm text-band-dim hover:bg-ink-muted rounded-lg transition-colors"
                       >
                         <PaperclipIcon className="w-4 h-4 text-sky-400" />
                         <span className="font-medium">{t.uploadCase}</span>
@@ -4411,8 +4905,7 @@ export const ChatArea = memo(function ChatArea() {
                       <button
                         type="button"
                         onClick={() => { openCaseCamera(); setShowAttachMenu(false); setShowTemplateMenu(false); }}
-                        disabled={isTimeUp}
-                        className="flex items-center justify-center w-10 h-10 text-sky-300 hover:bg-ink-muted rounded-lg border border-ink-border disabled:opacity-50"
+                        className="flex items-center justify-center w-10 h-10 text-sky-300 hover:bg-ink-muted rounded-lg border border-ink-border"
                         title="Case photo"
                       >
                         <PlusIcon className="w-4 h-4" />
@@ -4422,8 +4915,7 @@ export const ChatArea = memo(function ChatArea() {
                       <button
                         type="button"
                         onClick={() => { void openFormatFilePicker(); setShowAttachMenu(false); setShowTemplateMenu(false); }}
-                        disabled={isTimeUp}
-                        className="flex-1 flex items-center gap-2 px-3 py-2.5 text-sm text-band-dim hover:bg-ink-muted rounded-lg transition-colors disabled:opacity-50"
+                        className="flex-1 flex items-center gap-2 px-3 py-2.5 text-sm text-band-dim hover:bg-ink-muted rounded-lg transition-colors"
                       >
                         <TemplateIcon className="w-4 h-4 text-amber-400" />
                         <span className="font-medium">{t.uploadFormat}</span>
@@ -4431,8 +4923,7 @@ export const ChatArea = memo(function ChatArea() {
                       <button
                         type="button"
                         onClick={() => { openFormatCamera(); setShowAttachMenu(false); setShowTemplateMenu(false); }}
-                        disabled={isTimeUp}
-                        className="flex items-center justify-center w-10 h-10 text-amber-300 hover:bg-ink-muted rounded-lg border border-ink-border disabled:opacity-50"
+                        className="flex items-center justify-center w-10 h-10 text-amber-300 hover:bg-ink-muted rounded-lg border border-ink-border"
                         title="Format photo"
                       >
                         <PlusIcon className="w-4 h-4" />
@@ -4441,8 +4932,7 @@ export const ChatArea = memo(function ChatArea() {
                     <button
                       type="button"
                       onClick={() => setShowTemplateMenu((v) => !v)}
-                      disabled={isTimeUp}
-                      className="w-full flex items-center justify-between gap-2 px-3 py-2.5 text-sm text-band-dim hover:bg-ink-muted rounded-lg transition-colors disabled:opacity-50"
+                      className="w-full flex items-center justify-between gap-2 px-3 py-2.5 text-sm text-band-dim hover:bg-ink-muted rounded-lg transition-colors"
                     >
                       <span className="flex items-center gap-2 font-medium">
                         <TemplateIcon className="w-4 h-4 text-amber-400" />
@@ -4460,29 +4950,71 @@ export const ChatArea = memo(function ChatArea() {
                             type="text"
                             value={templateSearchQuery}
                             onChange={(e) => setTemplateSearchQuery(e.target.value)}
-                            placeholder="Search templates..."
+                            placeholder={t.searchTemplates}
                             className="w-full bg-ink border border-ink-border text-white text-xs rounded-lg pl-8 pr-3 py-1.5 outline-none focus:border-white/40"
                             autoFocus
                             onClick={(e) => e.stopPropagation()}
                           />
                         </div>
-                        <div className="max-h-40 overflow-y-auto space-y-1 custom-scrollbar">
+                        <div className={`${isJudgeMode ? 'max-h-56' : 'max-h-64'} overflow-y-auto space-y-1 custom-scrollbar`}>
                           {filteredTemplates.length > 0 ? (
-                            filteredTemplates.map(option => (
-                              <button
-                                key={option.id}
-                                onClick={() => {
-                                  handleTemplateSelect(option.id);
-                                  setShowAttachMenu(false);
-                                  setShowTemplateMenu(false);
-                                }}
-                                className="w-full text-left px-3 py-2 text-xs text-band-dim hover:bg-neutral-800 hover:text-white rounded-lg transition-colors"
-                              >
-                                {option.name}
-                              </button>
-                            ))
+                            filteredTemplates.map((option, optionIndex) => {
+                              const firstOfGroup = !!option.group && option.group !== filteredTemplates[optionIndex - 1]?.group;
+                              // Catalogue practice areas fold away unless opened or searching.
+                              if (option.collapsible && !templateSearching) {
+                                const isOpen = openTemplateGroup === option.group;
+                                if (!firstOfGroup && !isOpen) return null;
+                                return (
+                                  <React.Fragment key={option.id}>
+                                    {firstOfGroup && (
+                                      <button
+                                        onClick={() => setOpenTemplateGroup(isOpen ? null : option.group!)}
+                                        className="w-full flex items-center justify-between gap-2 px-3 py-2 text-left text-[11px] font-semibold text-band-dim hover:bg-neutral-800 rounded-lg transition-colors"
+                                      >
+                                        <span className="truncate">{templateLabel(option.group!, language)}</span>
+                                        <span className="flex items-center gap-1.5 shrink-0 text-band-mute">
+                                          {templateGroupCounts[option.group!]}
+                                          <svg className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+                                        </span>
+                                      </button>
+                                    )}
+                                    {isOpen && (
+                                      <button
+                                        onClick={() => {
+                                          handleTemplateSelect(option.id);
+                                          setShowAttachMenu(false);
+                                          setShowTemplateMenu(false);
+                                        }}
+                                        className="w-full text-left pl-5 pr-3 py-2 text-xs text-band-dim hover:bg-neutral-800 hover:text-white rounded-lg transition-colors"
+                                      >
+                                        {templateOptionLabel(option)}
+                                      </button>
+                                    )}
+                                  </React.Fragment>
+                                );
+                              }
+                              return (
+                              <React.Fragment key={option.id}>
+                                {firstOfGroup && (
+                                  <div className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider text-band-mute">
+                                    {templateLabel(option.group!, language)}
+                                  </div>
+                                )}
+                                <button
+                                  onClick={() => {
+                                    handleTemplateSelect(option.id);
+                                    setShowAttachMenu(false);
+                                    setShowTemplateMenu(false);
+                                  }}
+                                  className="w-full text-left px-3 py-2 text-xs text-band-dim hover:bg-neutral-800 hover:text-white rounded-lg transition-colors"
+                                >
+                                  {templateOptionLabel(option)}
+                                </button>
+                              </React.Fragment>
+                              );
+                            })
                           ) : (
-                            <div className="px-3 py-2 text-xs text-band-mute text-center">No templates found</div>
+                            <div className="px-3 py-2 text-xs text-band-mute text-center">{t.noTemplatesFound}</div>
                           )}
                         </div>
                       </div>
@@ -4498,7 +5030,6 @@ export const ChatArea = memo(function ChatArea() {
                 accept="image/*,.pdf,.doc,.docx,.txt,.rtf,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,*/*"
                 className="hidden"
                 onChange={handleCaseFileChange}
-                disabled={isTimeUp}
               />
               <input
                 ref={caseCameraInputRef}
@@ -4507,7 +5038,6 @@ export const ChatArea = memo(function ChatArea() {
                 capture="environment"
                 className="hidden"
                 onChange={handleCaseFileChange}
-                disabled={isTimeUp}
               />
               <input
                 ref={formatFileInputRef}
@@ -4531,12 +5061,10 @@ export const ChatArea = memo(function ChatArea() {
                 <button
                   type="button"
                   onClick={() => {
-                    if (isTimeUp) return;
                     setShowAttachMenu((v) => !v);
                     if (showAttachMenu) setShowTemplateMenu(false);
                   }}
-                  disabled={isTimeUp}
-                  className={`mb-1 flex items-center justify-center w-10 h-10 rounded-xl border transition-colors flex-shrink-0 disabled:opacity-50 ${
+                  className={`mb-1 flex items-center justify-center w-10 h-10 rounded-xl border transition-colors flex-shrink-0 ${
                     showAttachMenu
                       ? 'bg-white border-white text-black'
                       : 'bg-ink-muted border-ink-border text-band-dim hover:text-white hover:bg-neutral-800'
@@ -4558,9 +5086,8 @@ export const ChatArea = memo(function ChatArea() {
                       speechBaseTextRef.current = next;
                     }
                   }}
-                  placeholder={isTimeUp ? t.timeLimitReached : t.messagePlaceholder}
-                  disabled={isTimeUp}
-                  className="flex-1 min-h-[44px] max-h-36 p-2.5 bg-transparent resize-none outline-none text-white placeholder-band-mute disabled:opacity-50 text-base font-semibold leading-relaxed custom-scrollbar"
+                  placeholder={t.messagePlaceholder}
+                  className="flex-1 min-h-[44px] max-h-36 p-2.5 bg-transparent resize-none outline-none text-band placeholder-band-mute text-base font-semibold leading-relaxed custom-scrollbar"
                   rows={1}
                   onKeyDown={(e) => { 
                     if (e.key === 'Enter' && !e.shiftKey) { 
@@ -4573,9 +5100,9 @@ export const ChatArea = memo(function ChatArea() {
                 <div className="pb-1 pr-1 flex gap-1.5 flex-shrink-0">
                   {isSpeechSupported && (
                     <button
-                      onClick={toggleListening}
-                      disabled={isTimeUp || isLoading}
-                      className={`p-2 rounded-xl transition-colors shadow-sm ${isListening ? 'bg-red-500/20 text-red-500 hover:bg-red-500/30' : 'bg-ink-muted text-band-mute hover:bg-neutral-800 hover:text-white'} disabled:opacity-50 disabled:cursor-not-allowed`}
+                      onClick={() => void toggleListening()}
+                      disabled={isLoading}
+                      className={`p-2 rounded-xl transition-all duration-150 shadow-sm ${isListening ? 'bg-white text-black hover:bg-neutral-200' : 'bg-ink-muted text-band-mute hover:bg-neutral-800 hover:text-white'} disabled:opacity-50 disabled:cursor-not-allowed`}
                       title={isListening ? 'Stop voice typing' : 'Speech to Text'}
                       aria-pressed={isListening}
                     >
@@ -4586,7 +5113,7 @@ export const ChatArea = memo(function ChatArea() {
                     <button
                       type="button"
                       onClick={abortInFlight}
-                      className="flex items-center gap-1.5 px-3 py-2 bg-red-500 text-white rounded-xl hover:bg-red-600 transition-colors shadow-sm text-sm font-medium"
+                      className="flex items-center gap-1.5 px-3 py-2 bg-white text-black rounded-xl hover:bg-neutral-200 active:scale-[0.97] transition-all duration-150 shadow-sm text-sm font-medium"
                       title={t.stopGenerating}
                     >
                       <StopIcon className="w-4 h-4" />
@@ -4595,7 +5122,7 @@ export const ChatArea = memo(function ChatArea() {
                   ) : (
                     <button 
                       onClick={() => handleSend(false)}
-                      disabled={!canSend || isTimeUp}
+                      disabled={!canSend}
                       className="p-2 bg-white text-black rounded-xl hover:bg-neutral-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
                     >
                       <SendIcon className="w-5 h-5" />
@@ -4610,7 +5137,7 @@ export const ChatArea = memo(function ChatArea() {
 
             <button 
               onClick={() => handleSend(true)}
-              disabled={!canGenerate || isTimeUp || isLoading}
+              disabled={!canGenerate || isLoading}
               className="w-full flex items-center justify-center gap-2 bg-white text-black py-3 rounded-2xl font-medium hover:bg-neutral-200 transition-all shadow-md disabled:opacity-50 disabled:cursor-not-allowed group"
             >
               <SparklesIcon className="w-5 h-5 text-yellow-300 group-hover:animate-pulse" />
@@ -4619,6 +5146,12 @@ export const ChatArea = memo(function ChatArea() {
           </div>
         </div>
       </div>
+      <IncreaseChatLimitModal
+        open={chatLimitOpen}
+        reason={chatLimitReason}
+        usedChars={getSessionCharCount(messages)}
+        onClose={() => setChatLimitOpen(false)}
+      />
     </div>
   );
 });

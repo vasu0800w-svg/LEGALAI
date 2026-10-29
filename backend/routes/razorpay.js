@@ -8,14 +8,15 @@
  *    writes the plan with the Admin SDK (Firestore rules block the client).
  */
 import Razorpay from 'razorpay';
-import crypto from 'crypto';
-import { adminReady, adminInitError, getDb, userDoc, orderDoc, paymentDoc } from '../lib/firebaseAdmin.js';
+import { adminReady, getDb, userDoc, orderDoc, paymentDoc } from '../lib/firebaseAdmin.js';
 import { verifyRequestUser } from '../lib/authUser.js';
 import { DEFAULT_PLAN_PRICES, PLAN_DURATION_DAYS, DEFAULT_PAID_LIMITS, getPlanLimits, loadFreePlanLimits } from '../middleware/planLimits.js';
 import { loadPlanCatalog, addonById, isChatLimitAddon } from '../lib/planCatalog.js';
 import { effectivePlan } from '../lib/usageGuard.js';
 import { quoteCustomPlan } from '../lib/customPlan.js';
 import { loadCustomPricing } from './customPlan.js';
+import { applyCors } from '../lib/httpSecurity.js';
+import { razorpaySignatureValid, paymentMatchesOrder } from '../lib/razorpayCrypto.js';
 import {
   nextExpiryFrom,
   nextPlanAfterPurchase,
@@ -26,11 +27,7 @@ import {
   persistLimits,
 } from '../lib/entitlementMath.js';
 
-const cors = (res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-};
+const cors = (req, res) => applyCors(req, res, 'POST, OPTIONS');
 
 const VALID_PLANS = ['basic', 'pro', 'annual'];
 
@@ -102,17 +99,16 @@ const resolvePlanPrice = async (planId) => {
 
 /** POST /api/create-order  body: { planId }  header: Bearer <Firebase ID token> */
 export async function createOrderHandler(req, res) {
-  cors(res);
+  cors(req, res);
   try {
     if (!adminReady()) {
       return res.status(503).json({
         error: 'SUBSCRIPTIONS_UNAVAILABLE',
         message: 'Subscriptions are temporarily unavailable. Please try again later.',
-        detail: adminInitError(),
       });
     }
 
-    const authUser = await verifyRequestUser(req);
+    const authUser = await verifyRequestUser(req, { checkRevoked: true });
     if (!authUser) {
       return res.status(401).json({
         error: 'UNAUTHENTICATED',
@@ -248,14 +244,14 @@ export async function createOrderHandler(req, res) {
     console.error('[Razorpay] create-order error:', err);
     const status = err?.statusCode === 401 ? 401 : err?.statusCode || 500;
     if (status === 401) {
-      return res.status(401).json({
-        error: 'AUTH_FAILED',
-        message: 'Razorpay authentication failed. Check KEY_ID / KEY_SECRET.',
+      return res.status(503).json({
+        error: 'PAYMENTS_UNAVAILABLE',
+        message: 'Payments are temporarily unavailable. Please try again later.',
       });
     }
     return res.status(500).json({
       error: 'ORDER_CREATE_FAILED',
-      message: err?.error?.description || err?.message || 'Failed to create Razorpay order.',
+      message: 'Failed to create Razorpay order.',
     });
   }
 }
@@ -266,8 +262,17 @@ export async function createOrderHandler(req, res) {
  * header: Bearer <Firebase ID token>
  */
 export async function verifyPaymentHandler(req, res) {
-  cors(res);
+  cors(req, res);
   try {
+    const authUser = await verifyRequestUser(req, { checkRevoked: true });
+    if (!authUser) {
+      return res.status(401).json({
+        error: 'UNAUTHENTICATED',
+        message: 'Please sign in again so we can activate your plan.',
+        success: false,
+      });
+    }
+
     const orderId = req.body?.razorpay_order_id;
     const paymentId = req.body?.razorpay_payment_id;
     const signature = req.body?.razorpay_signature;
@@ -282,18 +287,14 @@ export async function verifyPaymentHandler(req, res) {
 
     const keySecret = (await resolveRazorpayKeys()).key_secret;
     if (!keySecret) {
-      return res.status(500).json({
+      return res.status(503).json({
         error: 'NOT_CONFIGURED',
-        message: 'Razorpay KEY_SECRET is not configured on the server.',
+        message: 'Payments are temporarily unavailable.',
         success: false,
       });
     }
 
-    const payload = `${orderId}|${paymentId}`;
-    const expected = crypto.createHmac('sha256', keySecret).update(payload).digest('hex');
-    const a = Buffer.from(expected);
-    const b = Buffer.from(String(signature));
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    if (!razorpaySignatureValid(orderId, paymentId, signature, keySecret)) {
       return res.status(400).json({
         error: 'SIGNATURE_MISMATCH',
         message: 'Payment signature verification failed.',
@@ -302,22 +303,23 @@ export async function verifyPaymentHandler(req, res) {
     }
 
     if (!adminReady()) {
-      // Signature is valid but we cannot record the plan. Say so loudly instead
-      // of letting the phone grant itself a subscription.
-      console.error('[Razorpay] payment verified but Firebase Admin is not configured — plan NOT granted:', orderId);
+      console.error('[Razorpay] payment verified but Firebase Admin is not configured — plan NOT granted');
       return res.status(503).json({
         error: 'PLAN_GRANT_UNAVAILABLE',
         message: 'Payment received but the subscription could not be activated. Please contact support with your payment id.',
         success: false,
-        payment_id: paymentId,
       });
     }
 
-    const authUser = await verifyRequestUser(req);
-    if (!authUser) {
-      return res.status(401).json({
-        error: 'UNAUTHENTICATED',
-        message: 'Please sign in again so we can activate your plan.',
+    let remotePayment = null;
+    try {
+      const { client } = await getRazorpayClient();
+      remotePayment = await client.payments.fetch(String(paymentId));
+    } catch (err) {
+      console.warn('[Razorpay] payment lookup failed', err?.statusCode || err?.code || 'failed');
+      return res.status(400).json({
+        error: 'PAYMENT_LOOKUP_FAILED',
+        message: 'This payment could not be confirmed.',
         success: false,
       });
     }
@@ -338,6 +340,15 @@ export async function verifyPaymentHandler(req, res) {
       if (order.uid !== authUser.uid) {
         const err = new Error('ORDER_OWNER_MISMATCH');
         err.code = 'ORDER_OWNER_MISMATCH';
+        throw err;
+      }
+      if (!paymentMatchesOrder(remotePayment, {
+        id: orderId,
+        amount: order.amount,
+        currency: order.currency || 'INR',
+      })) {
+        const err = new Error('PAYMENT_MISMATCH');
+        err.code = 'PAYMENT_MISMATCH';
         throw err;
       }
       if (order.status === 'paid') {
@@ -597,16 +608,19 @@ export async function verifyPaymentHandler(req, res) {
     if (code === 'CUSTOM_QUOTE_MISSING') {
       return res.status(400).json({ error: code, message: 'This custom-plan order has no locked quote. It was not activated.', success: false });
     }
-    console.error('[Razorpay] verify-payment error:', err);
+    if (code === 'PAYMENT_MISMATCH') {
+      return res.status(400).json({ error: code, message: 'This payment does not match the Casemate order.', success: false });
+    }
+    console.error('[Razorpay] verify-payment error:', err?.code || 'failed');
     return res.status(500).json({
       error: 'VERIFY_FAILED',
-      message: err?.message || 'Failed to verify payment.',
+      message: 'Failed to verify payment.',
       success: false,
     });
   }
 }
 
-export function razorpayOptionsHandler(_req, res) {
-  cors(res);
+export function razorpayOptionsHandler(req, res) {
+  cors(req, res);
   res.status(204).end();
 }

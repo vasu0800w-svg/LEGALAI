@@ -1,29 +1,24 @@
-import { db, auth } from './firebaseService';
+import { db, auth, getAppCheckHeader } from './firebaseService';
 import { doc, getDoc, setDoc, onSnapshot, Unsubscribe } from 'firebase/firestore';
-import {
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-  signInAnonymously,
-} from 'firebase/auth';
+import { isAdminEmail } from '../utils/adminIdentity';
 
-export type AppConfigDoc = 'plans' | 'announcement' | 'templates' | 'api_keys' | 'email_keys';
+export type AppConfigDoc = 'plans' | 'announcement' | 'templates' | 'api_keys' | 'email_keys' | 'promo_codes';
 
 export type CloudLegalTemplate = {
   id: string;
   name: string;
   content: string;
+  /** Shown to judges only when 'judge'; everything else is an advocate template. */
+  audience?: 'advocate' | 'judge';
 };
 
 const configRef = (docId: AppConfigDoc) => doc(db, 'app_config', docId);
 
-const getAdminLocalCreds = (): { email: string; password: string } => {
+const clearLegacyAdminCreds = () => {
   try {
-    return JSON.parse(
-      localStorage.getItem('casemate_admin_creds') ||
-        '{"email":"admin@casemate.com","password":"admin123"}'
-    );
+    localStorage.removeItem('casemate_admin_creds');
   } catch {
-    return { email: 'admin@casemate.com', password: 'admin123' };
+    /* ignore */
   }
 };
 
@@ -42,46 +37,34 @@ const withTimeout = async <T,>(promise: Promise<T>, ms: number, label: string): 
 };
 
 /**
- * Ensure Firebase Auth so Firestore write rules pass.
- * Prefers Email/Password using admin panel credentials; falls back to Anonymous.
+ * Admin writes require a live Firebase session for the configured admin email.
+ * Passwords are never read from localStorage or created from the client.
  */
 export const ensureConfigWriteAuth = async (): Promise<boolean> => {
+  clearLegacyAdminCreds();
+  return isAdminEmail(auth.currentUser?.email);
+};
+
+const apiBase = () =>
+  String((import.meta as { env?: Record<string, string> }).env?.VITE_API_BASE_URL || '').replace(/\/$/, '');
+
+/** Confirms the signed-in Firebase user is accepted by the admin HTTP gate. */
+export const verifyAdminSession = async (): Promise<boolean> => {
+  clearLegacyAdminCreds();
+  const current = auth.currentUser;
+  if (!current || !isAdminEmail(current.email)) return false;
+  const base = apiBase();
+  if (!base) return true;
   try {
-    if (auth.currentUser) return true;
-
-    const { email, password } = getAdminLocalCreds();
-    if (email && password && password.length >= 6) {
-      try {
-        await withTimeout(signInWithEmailAndPassword(auth, email, password), 12000, 'signIn');
-        return !!auth.currentUser;
-      } catch (signInErr: any) {
-        const code = signInErr?.code || '';
-        if (code === 'auth/user-not-found' || code === 'auth/invalid-credential' || code === 'auth/wrong-password') {
-          try {
-            await withTimeout(createUserWithEmailAndPassword(auth, email, password), 12000, 'createUser');
-            return !!auth.currentUser;
-          } catch (createErr: any) {
-            if (createErr?.code === 'auth/email-already-in-use') {
-              try {
-                await withTimeout(signInWithEmailAndPassword(auth, email, password), 12000, 'signInRetry');
-                return !!auth.currentUser;
-              } catch {
-                /* fall through */
-              }
-            }
-            console.warn('[app_config] Email admin auth failed, trying anonymous', createErr);
-          }
-        } else {
-          console.warn('[app_config] Email sign-in failed, trying anonymous', signInErr);
-        }
-      }
-    }
-
-    await withTimeout(signInAnonymously(auth), 12000, 'anonymous');
-    return !!auth.currentUser;
-  } catch (error) {
-    console.error('[app_config] Auth required for cloud write failed:', error);
-    return false;
+    const token = await current.getIdToken();
+    const appCheck = await getAppCheckHeader();
+    const res = await fetch(`${base}/api/admin/session`, {
+      headers: { Authorization: `Bearer ${token}`, ...appCheck },
+    });
+    if (res.status === 401 || res.status === 403) return false;
+    return true;
+  } catch {
+    return true;
   }
 };
 

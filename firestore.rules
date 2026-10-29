@@ -14,7 +14,7 @@ service cloud.firestore {
     // change (e.g. free -> pro without paying) is rejected.
     function entitlementsUnchanged() {
       return !request.resource.data.diff(resource.data).affectedKeys()
-        .hasAny(['plan', 'subscriptionExpiryDate', 'aiUsage', 'devices', 'planSource', 'planOrderId', 'promoKind', 'promoExpiresAt', 'promoRedeemedAt', 'promoCode']);
+        .hasAny(['plan', 'subscriptionExpiryDate', 'aiUsage', 'devices', 'planSource', 'planOrderId', 'promoKind', 'promoExpiresAt', 'promoRedeemedAt', 'promoCode', 'addOns', 'billingCycleStart', 'paymentStatus', 'grantedLimits', 'entitlementsVersion', 'billingHistory', 'customPlan']);
     }
 
     // Per-user chat / profile data (and per-chat docs under /chats/{chatId})
@@ -24,7 +24,7 @@ service cloud.firestore {
       // A new account may only start on the free plan.
       allow create: if request.auth != null && request.auth.uid == userId
         && (!('plan' in request.resource.data) || request.resource.data.plan == 'free')
-        && !request.resource.data.keys().hasAny(['aiUsage', 'devices', 'planSource', 'planOrderId', 'promoKind', 'promoExpiresAt', 'promoRedeemedAt', 'promoCode']);
+        && !request.resource.data.keys().hasAny(['aiUsage', 'devices', 'planSource', 'planOrderId', 'promoKind', 'promoExpiresAt', 'promoRedeemedAt', 'promoCode', 'addOns', 'billingCycleStart', 'paymentStatus', 'grantedLimits', 'entitlementsVersion', 'billingHistory', 'customPlan']);
 
       allow update: if request.auth != null && request.auth.uid == userId
         && entitlementsUnchanged();
@@ -46,6 +46,10 @@ service cloud.firestore {
 
     // Payment records are written by the backend only.
     match /orders/{orderId} {
+      allow read, write: if false;
+    }
+
+    match /payments/{paymentId} {
       allow read, write: if false;
     }
 
@@ -127,8 +131,24 @@ service cloud.firestore {
     // Anonymized draft-style memory (structure only — no names/facts)
     match /learned_styles/{id} {
       allow read: if request.auth != null;
-      allow create, update: if request.auth != null;
+      allow create, update: if request.auth != null
+        && request.resource.data.keys().hasOnly(['skeleton', 'language', 'caseType', 'notes', 'createdAt', 'updatedAt'])
+        && request.resource.data.skeleton is string
+        && request.resource.data.skeleton.size() > 0
+        && request.resource.data.skeleton.size() < 2500
+        && request.resource.data.language is string
+        && request.resource.data.language.size() < 40
+        && request.resource.data.caseType is string
+        && request.resource.data.caseType.size() < 80
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() < 500
+        && request.resource.data.createdAt is number
+        && request.resource.data.updatedAt is number;
       allow delete: if false;
+    }
+
+    match /auth_otp_limits/{id} {
+      allow read, write: if false;
     }
   }
 }

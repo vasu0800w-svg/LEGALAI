@@ -35,7 +35,8 @@ const authHeader = async (): Promise<Record<string, string>> => {
   if (!token) {
     throw new Error('Please sign in again before paying.');
   }
-  return { Authorization: `Bearer ${token}` };
+  const { getAppCheckHeader } = await import('./firebaseService');
+  return { Authorization: `Bearer ${token}`, ...(await getAppCheckHeader()) };
 };
 
 async function ensureCheckoutScript(): Promise<boolean> {

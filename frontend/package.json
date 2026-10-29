@@ -7,14 +7,14 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "build:android": "vite build && npx cap sync android",
+    "build:android": "VITE_APP_TARGET=android vite build && npx cap sync android",
     "open:android": "node ./scripts/open-android.mjs",
     "sync:android": "npx cap sync android",
     "deploy:hosting": "npm run build && cd .. && npx firebase-tools deploy --only hosting"
   },
   "dependencies": {
     "@capacitor/app": "^8.1.1",
-    "@capacitor/core": "^8.5.0",
+    "@capacitor/core": "^8.5.1",
     "@capacitor/filesystem": "^8.1.2",
     "@capacitor/share": "^8.0.1",
     "@capacitor/splash-screen": "^8.0.2",
@@ -26,11 +26,13 @@
     "@types/react-dom": "^19.2.4",
     "docx": "latest",
     "firebase": "^12.17.1",
+    "jszip": "^3.10.1",
+    "pdfjs-dist": "^6.4.299",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "@capacitor/android": "^8.5.0",
+    "@capacitor/android": "^8.5.1",
     "@capacitor/cli": "^8.5.0",
     "@types/node": "latest",
     "@vitejs/plugin-react": "latest",

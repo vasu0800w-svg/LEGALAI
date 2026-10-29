@@ -1,12 +1,18 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo, ReactNode } from 'react';
-import { User, ChatSession, Message, CaseLearning, Attachment } from '../types';
+import { User, ChatSession, Message, CaseLearning, Attachment, UserMode, normalizeUserMode } from '../types';
 import { auth, db } from '../services/firebaseService';
-import { doc, onSnapshot, setDoc, runTransaction, collection, getDocs, writeBatch } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, deleteDoc, runTransaction, collection, getDocs, writeBatch } from 'firebase/firestore';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
-import { getPlanLimits, todayKey, PLAN_FEATURES, DEFAULT_PLAN_PRICES, isUnlimitedEmail, sanitizeSubscriptionPlans } from '../utils/planLimits';
+import { getPlanLimits, todayKey, PLAN_FEATURES, DEFAULT_PLAN_PRICES, hasUnlimitedAccess, sanitizeSubscriptionPlans, applyFreePlanConfig, applyPaidPlanConfig } from '../utils/planLimits';
+import { fetchPromoStatus, PENDING_PROMO_KEY, redeemPromoCode as requestPromoCode } from '../services/promoService';
+import { PENDING_CUSTOM_PLAN_KEY } from '../services/customPlanService';
+import { fetchEntitlements } from '../services/entitlementsService';
 import { subscribeAppConfig, CloudLegalTemplate } from '../services/adminConfigService';
 import { checkAndSendExpiryReminder } from '../services/emailService';
+import { touchUserDirectory } from '../services/userDirectoryService';
 import { consumeColdStart } from '../utils/nativeNavigation';
+import { isAutomaticChatTitle } from '../utils/chatLabel';
+import { isAdminEmail } from '../utils/adminIdentity';
 
 export interface SubscriptionPlanConfig {
   id: string;
@@ -16,12 +22,15 @@ export interface SubscriptionPlanConfig {
 }
 
 const DEFAULT_SUBSCRIPTION_PLANS: SubscriptionPlanConfig[] = [
-  { id: 'basic', name: 'Basic Plan', price: DEFAULT_PLAN_PRICES.basic, features: [...PLAN_FEATURES.basic] },
-  { id: 'pro', name: 'Pro Plan', price: DEFAULT_PLAN_PRICES.pro, features: [...PLAN_FEATURES.pro] },
+  { id: 'basic', name: 'Casemate Basic', price: DEFAULT_PLAN_PRICES.basic, features: [...PLAN_FEATURES.basic] },
+  { id: 'pro', name: 'Casemate Pro', price: DEFAULT_PLAN_PRICES.pro, features: [...PLAN_FEATURES.pro] },
   { id: 'annual', name: 'Annual Plan', price: DEFAULT_PLAN_PRICES.annual, features: [...PLAN_FEATURES.annual] },
 ];
 
 const sessionMessageCount = (s: ChatSession) => (Array.isArray(s.messages) ? s.messages.length : 0);
+
+/** Chats made before modes existed have no tag and belong to the advocate history. */
+const sessionMode = (s: ChatSession): UserMode => (s?.userMode === 'judge' ? 'judge' : 'advocate');
 
 /** Merge local + cloud chats without wiping richer history */
 const attachmentUrlCount = (messages: Message[]) =>
@@ -99,6 +108,7 @@ const mergeChatSessions = (
       messages: Array.isArray(session.messages) ? session.messages : [],
       updatedAt: session.updatedAt || 0,
       title: session.title || 'New Case Analysis',
+      ...(session.caseDate ? { caseDate: String(session.caseDate) } : {}),
     };
     const existing = map.get(normalized.id);
     if (!existing) {
@@ -116,12 +126,17 @@ const mergeChatSessions = (
           : attachmentUrlCount(normalized.messages) >= attachmentUrlCount(existing.messages)
             ? normalized
             : existing;
+    const incomingNewer = (normalized.updatedAt || 0) > (existing.updatedAt || 0);
+    const caseDate = incomingNewer
+      ? (normalized.caseDate || existing.caseDate)
+      : (existing.caseDate || normalized.caseDate);
     map.set(normalized.id, {
       ...existing,
       ...richer,
       messages,
       updatedAt: Math.max(existing.updatedAt || 0, normalized.updatedAt || 0),
-      title: richer.title || existing.title,
+      title: incomingNewer ? (normalized.title || existing.title) : (existing.title || normalized.title),
+      ...(caseDate ? { caseDate } : {}),
     });
   };
 
@@ -187,14 +202,19 @@ interface AppContextType {
   trimMessagesAfter: (messageId: string) => void;
   deleteChatSession: (sessionId: string) => void;
   renameChatSession: (sessionId: string, newTitle: string) => void;
+  nameChatFromClient: (sessionId: string, clientName: string, caseDate?: string | null) => void;
   usageSeconds: number;
   subscribeUsageSeconds: (listener: (seconds: number) => void) => () => void;
   isTimeUp: boolean;
   draftCount: number;
   incrementDraftCount: () => boolean;
+  decrementDraftCount: () => void;
   consumeDailyUse: () => boolean;
+  aiUsage: { month?: string; requests?: number; images?: number; day?: string; dayRequests?: number; monthDrafts?: number } | null;
   language: string;
   setLanguage: (lang: string) => void;
+  userMode: UserMode;
+  setUserMode: (mode: UserMode) => void;
   isSettingsOpen: boolean;
   setIsSettingsOpen: (isOpen: boolean) => void;
   isSidebarOpen: boolean;
@@ -213,6 +233,7 @@ interface AppContextType {
   cloudTemplates: CloudLegalTemplate[];
   caseLearnings: CaseLearning[];
   upsertCaseLearning: (learning: CaseLearning) => void;
+  redeemPromoCode: (code: string) => Promise<{ ok: boolean; kind?: '14d' | 'forever'; expiresAt?: number | null; alreadyUnlimited?: boolean; alreadyActive?: boolean }>;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -271,6 +292,14 @@ const sanitizeMessage = (m: Message): Message => ({
   timestamp: typeof m?.timestamp === 'number' ? m.timestamp : 0,
   ...(m?.isDocument ? { isDocument: true } : {}),
   ...(typeof m?.evidenceNotes === 'string' && m.evidenceNotes ? { evidenceNotes: m.evidenceNotes } : {}),
+  ...(Array.isArray(m?.suggestedQuestions) && m.suggestedQuestions.length
+    ? {
+        suggestedQuestions: m.suggestedQuestions
+          .map((q) => String(q || '').trim())
+          .filter((q) => q.length >= 8 && q.length <= 180)
+          .slice(0, 4),
+      }
+    : {}),
   ...(Array.isArray(m?.attachments) && m.attachments.length
     ? { attachments: m.attachments.map(sanitizeAttachment) }
     : {}),
@@ -280,8 +309,48 @@ const sanitizeSession = (s: ChatSession): ChatSession => ({
   id: String(s?.id || ''),
   title: String(s?.title || 'New Case Analysis'),
   updatedAt: typeof s?.updatedAt === 'number' ? s.updatedAt : 0,
+  ...(s?.userMode === 'judge' || s?.userMode === 'advocate' ? { userMode: s.userMode } : {}),
+  ...(typeof s?.caseDate === 'string' && s.caseDate.trim() ? { caseDate: s.caseDate.trim().slice(0, 40) } : {}),
   messages: Array.isArray(s?.messages) ? s.messages.map(sanitizeMessage).filter((m) => m.id) : [],
 });
+
+const sessionStub = (s: ChatSession): ChatSession => ({
+  id: String(s?.id || ''),
+  title: String(s?.title || 'New Case Analysis'),
+  updatedAt: typeof s?.updatedAt === 'number' ? s.updatedAt : 0,
+  ...(s?.userMode === 'judge' || s?.userMode === 'advocate' ? { userMode: s.userMode } : {}),
+  ...(typeof s?.caseDate === 'string' && s.caseDate.trim() ? { caseDate: s.caseDate.trim().slice(0, 40) } : {}),
+  messages: [],
+});
+
+const chatIndexFromSessions = (sessions: ChatSession[]) =>
+  sessions
+    .filter((s) => s.id)
+    .map((s) => ({
+      id: s.id,
+      title: s.title || 'New Case Analysis',
+      updatedAt: s.updatedAt || 0,
+      messageCount: sessionMessageCount(s),
+      ...(s.userMode === 'judge' || s.userMode === 'advocate' ? { userMode: s.userMode } : {}),
+      ...(typeof s.caseDate === 'string' && s.caseDate.trim() ? { caseDate: s.caseDate.trim().slice(0, 40) } : {}),
+    }));
+
+const sessionsFromChatIndex = (rows: unknown): ChatSession[] => {
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .map((row) => {
+      const r = row as Record<string, unknown>;
+      return sessionStub({
+        id: String(r?.id || ''),
+        title: String(r?.title || 'New Case Analysis'),
+        updatedAt: typeof r?.updatedAt === 'number' ? r.updatedAt : 0,
+        ...(r?.userMode === 'judge' || r?.userMode === 'advocate' ? { userMode: r.userMode } : {}),
+        ...(typeof r?.caseDate === 'string' && r.caseDate ? { caseDate: String(r.caseDate) } : {}),
+        messages: [],
+      });
+    })
+    .filter((s) => s.id);
+};
 
 const truncateSessionToBytes = (s: ChatSession, maxBytes: number): ChatSession => {
   let out = sanitizeSession(s);
@@ -303,26 +372,29 @@ const truncateSessionToBytes = (s: ChatSession, maxBytes: number): ChatSession =
 };
 
 const trimSessionsForCloud = (sessions: ChatSession[], activeSessionId: string | null): ChatSession[] => {
-  const sanitized = sessions.map(sanitizeSession);
+  const sanitized = sessions.map(sanitizeSession).filter((s) => s.id);
   if (payloadBytes(sanitized) <= FIRESTORE_SAFE_BYTES) return sanitized;
+  // Keep every chat id on the user document so another phone can list them.
+  // Fill messages for the newest chats until the Firestore size budget is used.
   const ranked = [...sanitized].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  const picked: ChatSession[] = [];
-  const tryAdd = (s: ChatSession) => {
-    const remaining = FIRESTORE_SAFE_BYTES - payloadBytes(picked) - 2048;
-    if (remaining < 2000) return false;
+  const byId = new Map(ranked.map((s) => [s.id, sessionStub(s)]));
+  const tryFill = (s: ChatSession) => {
+    const remaining = FIRESTORE_SAFE_BYTES - payloadBytes([...byId.values()]) - 2048;
+    if (remaining < 2000) return;
     const sized = truncateSessionToBytes(s, remaining);
-    const next = [...picked, sized];
-    if (payloadBytes(next) > FIRESTORE_SAFE_BYTES) return false;
-    picked.push(sized);
-    return true;
+    const next = new Map(byId);
+    next.set(s.id, sized);
+    if (payloadBytes([...next.values()]) <= FIRESTORE_SAFE_BYTES) {
+      byId.set(s.id, sized);
+    }
   };
   const active = ranked.find((s) => s.id === activeSessionId);
-  if (active) tryAdd(active);
+  if (active) tryFill(active);
   for (const s of ranked) {
     if (s.id === activeSessionId) continue;
-    if (!tryAdd(s)) break;
+    tryFill(s);
   }
-  return picked;
+  return ranked.map((s) => byId.get(s.id) || sessionStub(s));
 };
 
 const chatDocRef = (userId: string, chatId: string) => doc(db, 'users_data', userId, 'chats', chatId);
@@ -352,14 +424,33 @@ const persistChatDocs = async (userId: string, sessions: ChatSession[], deleted:
     ops += 1;
     if (ops >= 400) await flush();
   };
-  for (const s of bodies) {
-    await queueSet(s.id, stripUndefined(s) as Record<string, unknown>);
+  try {
+    for (const s of bodies) {
+      await queueSet(s.id, stripUndefined(s) as Record<string, unknown>);
+    }
+    for (const id of deleted) {
+      if (!id || keep.has(id)) continue;
+      await queueDelete(id);
+    }
+    await flush();
+  } catch (err) {
+    console.warn('[Firebase] Chat batch write failed; writing each chat separately', err);
+    for (const s of bodies) {
+      try {
+        await setDoc(chatDocRef(userId, s.id), stripUndefined(s) as Record<string, unknown>);
+      } catch (one) {
+        console.warn('[Firebase] Chat doc write failed', s.id, one);
+      }
+    }
+    for (const id of deleted) {
+      if (!id || keep.has(id)) continue;
+      try {
+        await deleteDoc(chatDocRef(userId, id));
+      } catch {
+        /* ignore */
+      }
+    }
   }
-  for (const id of deleted) {
-    if (!id || keep.has(id)) continue;
-    await queueDelete(id);
-  }
-  await flush();
 };
 
 const sessionsFromChatDocs = (docs: { id: string; data: () => Record<string, unknown> }[]): ChatSession[] =>
@@ -401,6 +492,7 @@ const writeChatsToCloud = async (opts: {
     tx.set(ref, stripUndefined({
       ...(opts.extras || {}),
       chatSessions: toSave,
+      chatIndex: chatIndexFromSessions(merged),
       deletedChatIds: deleted,
       activeSessionId: opts.activeSessionId ?? null,
       updatedAt,
@@ -419,8 +511,19 @@ const writeChatsToCloud = async (opts: {
   return { sessions: result.sessions, deleted: result.deleted, updatedAt: result.updatedAt };
 };
 
+const withAdminRole = (user: User | null): User | null => {
+  if (!user) return null;
+  if (isAdminEmail(user.email)) {
+    return { ...user, role: 'admin', plan: user.plan && user.plan !== 'free' ? user.plan : 'pro' };
+  }
+  if (user.role === 'admin') {
+    return { ...user, role: 'user' };
+  }
+  return user;
+};
+
 export const AppProvider = ({ children }: { children: ReactNode }) => {
-  const initialUser = loadState<User | null>('casemate_current_user', null);
+  const initialUser = withAdminRole(loadState<User | null>('casemate_current_user', null));
   const isColdStart = consumeColdStart();
   const bootRef = useRef<{ activeId: string | null; sessions: ChatSession[] } | null>(null);
   if (!bootRef.current) {
@@ -429,19 +532,22 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     } else {
       const loaded = loadState<ChatSession[]>(`casemate_chats_${initialUser.id}`, []);
       const history = loaded.filter((s) => sessionMessageCount(s) > 0);
+      const bootMode = normalizeUserMode(loadState('casemate_user_mode', 'advocate'));
+      const inMode = history.filter((s) => sessionMode(s) === bootMode);
       if (isColdStart) {
         const fresh: ChatSession = {
           id: Date.now().toString(),
           title: 'New Case Analysis',
           messages: [],
           updatedAt: Date.now(),
+          userMode: bootMode,
         };
         bootRef.current = { activeId: fresh.id, sessions: [fresh, ...history] };
       } else {
         const savedActive = loadState<string | null>(`casemate_active_session_${initialUser.id}`, null);
         const resumeId =
-          (savedActive && history.some((s) => s.id === savedActive) ? savedActive : null) ||
-          history[0]?.id ||
+          (savedActive && inMode.some((s) => s.id === savedActive) ? savedActive : null) ||
+          inMode[0]?.id ||
           null;
         bootRef.current = { activeId: resumeId, sessions: loaded };
       }
@@ -467,15 +573,23 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     }
     return saved;
   });
-  const [isTimeUp, setIsTimeUp] = useState(() => initialUser ? loadState(`casemate_timeup_${initialUser.id}`, false) : false);
+  const [isTimeUp, setIsTimeUp] = useState(() => {
+    if (!initialUser) return false;
+    if (hasUnlimitedAccess(initialUser.email, initialUser) || (initialUser.plan && initialUser.plan !== 'free')) return false;
+    return loadState(`casemate_timeup_${initialUser.id}`, false);
+  });
   const [dailyUseDate, setDailyUseDate] = useState(() =>
     initialUser ? loadState(`casemate_daily_date_${initialUser.id}`, todayKey()) : todayKey()
   );
   
   const [draftCount, setDraftCount] = useState(() => initialUser ? loadState(`casemate_drafts_${initialUser.id}`, 0) : 0);
+  const [aiUsage, setAiUsage] = useState<{ month?: string; requests?: number; images?: number; day?: string; dayRequests?: number; monthDrafts?: number } | null>(null);
   const [lastResetDate, setLastResetDate] = useState(() => initialUser ? loadState(`casemate_reset_${initialUser.id}`, new Date().getMonth()) : new Date().getMonth());
 
-  const [language, setLanguage] = useState(() => loadState('casemate_lang', 'English'));
+  const [language, setLanguageState] = useState(() => loadState('casemate_lang', 'English'));
+  const languageAtRef = useRef<number>(loadState('casemate_lang_at', 0));
+  const [userMode, setUserModeState] = useState<UserMode>(() => normalizeUserMode(loadState('casemate_user_mode', 'advocate')));
+  const userModeAtRef = useRef<number>(loadState('casemate_user_mode_at', 0));
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isSubscriptionModalOpen, setIsSubscriptionModalOpen] = useState(false);
@@ -545,6 +659,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   const activeSessionIdRef = useRef(activeSessionId);
   const isTimeUpRef = useRef(isTimeUp);
   const extrasRef = useRef<Record<string, unknown>>({});
+  const rejectedPromoRef = useRef('');
   const flushInFlightRef = useRef(false);
   const pendingCloudFlushRef = useRef(false);
   const flushChatsToCloudNowRef = useRef<(silent?: boolean) => Promise<void>>(async () => undefined);
@@ -565,8 +680,36 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     name: user?.name,
     email: user?.email,
     language,
+    languageUpdatedAt: languageAtRef.current,
+    userMode,
+    userModeUpdatedAt: userModeAtRef.current,
     caseLearnings,
   };
+
+  const setUserMode = useCallback((mode: UserMode) => {
+    const next = normalizeUserMode(mode);
+    const at = Date.now();
+    userModeAtRef.current = at;
+    extrasRef.current = { ...extrasRef.current, userMode: next, userModeUpdatedAt: at };
+    try {
+      localStorage.setItem('casemate_user_mode', JSON.stringify(next));
+      localStorage.setItem('casemate_user_mode_at', JSON.stringify(at));
+      localStorage.setItem('casemate_user_mode_chosen', '1');
+    } catch { /* ignore */ }
+    setUserModeState(next);
+  }, []);
+
+  const setLanguage = useCallback((lang: string) => {
+    const at = Date.now();
+    languageAtRef.current = at;
+    extrasRef.current = { ...extrasRef.current, language: lang, languageUpdatedAt: at };
+    try {
+      localStorage.setItem('casemate_lang', JSON.stringify(lang));
+      localStorage.setItem('casemate_lang_at', JSON.stringify(at));
+      localStorage.setItem('casemate_lang_chosen', '1');
+    } catch { /* ignore */ }
+    setLanguageState(lang);
+  }, []);
 
   const publishUsageSeconds = (seconds: number) => {
     usageSecondsRef.current = seconds;
@@ -654,6 +797,36 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     chatSessionsRef.current = chatSessions;
   }, [chatSessions]);
 
+  // Advocate and judge keep separate histories. Each mode opens on its own chat,
+  // and a mode with no chats yet gets a blank one instead of an empty screen.
+  const blankChatForModeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!user?.id) return;
+    const mine = chatSessions.filter((s) => sessionMode(s) === userMode);
+    if (mine.some((s) => s.id === activeSessionId)) {
+      blankChatForModeRef.current = null;
+      return;
+    }
+    if (mine.length === 0) {
+      if (blankChatForModeRef.current && chatSessions.some((s) => s.id === blankChatForModeRef.current)) return;
+      const fresh: ChatSession = {
+        id: Date.now().toString(),
+        title: 'New Case Analysis',
+        messages: [],
+        updatedAt: Date.now(),
+        userMode,
+      };
+      blankChatForModeRef.current = fresh.id;
+      activeSessionIdRef.current = fresh.id;
+      setChatSessions((prev) => (prev.some((s) => sessionMode(s) === userMode) ? prev : [fresh, ...prev]));
+      setActiveSessionId(fresh.id);
+      return;
+    }
+    blankChatForModeRef.current = null;
+    const latest = mine.reduce((best, s) => ((s.updatedAt || 0) >= (best.updatedAt || 0) ? s : best));
+    setActiveSessionId(latest.id);
+  }, [userMode, chatSessions, activeSessionId, user?.id]);
+
   // Wait for Firebase Auth to restore before cloud read/write (Capacitor cold start)
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (fbUser) => {
@@ -672,6 +845,12 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         try {
           localStorage.setItem('casemate_subscription_plans', JSON.stringify(plans));
         } catch { /* ignore */ }
+      }
+      if (data && data.freeLimits && typeof data.freeLimits === 'object') {
+        applyFreePlanConfig(data.freeLimits as Record<string, number>);
+      }
+      if (data && data.paidLimits && typeof data.paidLimits === 'object') {
+        applyPaidPlanConfig(data.paidLimits as Record<string, Record<string, number>>);
       }
     });
     const unsubAnn = subscribeAppConfig('announcement', (data) => {
@@ -695,6 +874,33 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       unsubTemplates();
     };
   }, []);
+
+  // Presence ping so the admin panel can see who is using the app right now.
+  useEffect(() => {
+    if (!user?.id || user.role === 'admin' || !authReady || authUid !== user.id) return;
+    let cancelled = false;
+    const ping = () => {
+      if (cancelled || document.visibilityState === 'hidden') return;
+      const planLabel = hasUnlimitedAccess(user.email, user) ? 'unlimited' : (user.plan || 'free');
+      void touchUserDirectory({
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        plan: planLabel,
+      }).catch((err) => console.warn('[user_directory] presence write failed', err));
+    };
+    ping();
+    const id = window.setInterval(ping, 60_000);
+    const onVis = () => {
+      if (document.visibilityState === 'visible') ping();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [user?.id, user?.name, user?.email, user?.plan, user?.role, authReady, authUid]);
 
   // Reminder email when paid plan is close to expiry (7 / 3 / 1 days left)
   useEffect(() => {
@@ -724,28 +930,34 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   // Free tier: reset 1-hour daily allowance once per calendar day
   useEffect(() => {
     if (!user?.id) return;
-    if (isUnlimitedEmail(user.email) || (user.plan && user.plan !== 'free')) {
+    if (hasUnlimitedAccess(user.email, user) || (user.plan && user.plan !== 'free')) {
       setIsTimeUp(false);
       return;
     }
     const today = todayKey();
+    const allowance = getPlanLimits(user.plan, user.email, user).dailySeconds;
+    if (!allowance) {
+      setIsTimeUp(false);
+      return;
+    }
     if (dailyUseDate !== today) {
       setDailyUseDate(today);
-      commitUsageSeconds(3600);
+      commitUsageSeconds(allowance);
       setIsTimeUp(false);
       localStorage.setItem(`casemate_daily_date_${user.id}`, JSON.stringify(today));
-      localStorage.setItem(`casemate_usage_${user.id}`, JSON.stringify(3600));
+      localStorage.setItem(`casemate_usage_${user.id}`, JSON.stringify(allowance));
       localStorage.setItem(`casemate_timeup_${user.id}`, JSON.stringify(false));
     } else if (usageSecondsRef.current <= 0) {
       setIsTimeUp(true);
     }
-  }, [user?.id, user?.email, user?.plan, dailyUseDate]);
+  }, [user?.id, user?.email, user?.plan, user?.promoKind, user?.promoExpiresAt, dailyUseDate]);
 
   // Free tier: countdown the 1-hour daily timer while the app is open.
   // Tick subscribers (sidebar clock) without re-rendering the whole app every second.
   useEffect(() => {
-    if (!user?.id || isUnlimitedEmail(user.email) || (user.plan && user.plan !== 'free') || isTimeUp) return;
+    if (!user?.id || hasUnlimitedAccess(user.email, user) || (user.plan && user.plan !== 'free') || isTimeUp) return;
     const id = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       const prev = usageSecondsRef.current;
       if (prev <= 1) {
         commitUsageSeconds(0);
@@ -762,21 +974,14 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       }
     }, 1000);
     return () => window.clearInterval(id);
-  }, [user?.id, user?.email, user?.plan, isTimeUp]);
+  }, [user?.id, user?.email, user?.plan, user?.promoKind, user?.promoExpiresAt, isTimeUp]);
 
-  // Show upgrade prompt whenever free-tier daily limit is hit
+  // Keep chats readable when the daily window ends. Do not auto-open a second upgrade modal.
   useEffect(() => {
-    if (isUnlimitedEmail(user?.email)) {
-      setIsUpgradeModalOpen(false);
+    if (hasUnlimitedAccess(user?.email, user)) {
       if (isTimeUp) setIsTimeUp(false);
-      return;
     }
-    if (isTimeUp && (!user?.plan || user.plan === 'free')) {
-      setIsUpgradeModalOpen(true);
-    } else if (!isTimeUp) {
-      setIsUpgradeModalOpen(false);
-    }
-  }, [isTimeUp, user?.plan, user?.email]);
+  }, [isTimeUp, user?.plan, user?.email, user?.promoKind, user?.promoExpiresAt]);
 
   // Live cloud chats — same account on every phone (wait for real Auth, not localStorage)
   useEffect(() => {
@@ -821,6 +1026,18 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     const userRefDoc = doc(db, 'users_data', user.id);
     const cloudDocSessionsRef = { current: [] as ChatSession[] };
     const cloudColSessionsRef = { current: [] as ChatSession[] };
+    const seenCloud = { user: false, col: false };
+    const markCloudReady = (force = false) => {
+      if (cloudUserIdRef.current !== user.id) return;
+      if (cloudReadOkRef.current) return;
+      if (!force && !(seenCloud.user && seenCloud.col)) return;
+      cloudReadOkRef.current = true;
+      setIsCloudReady(true);
+      setIsCloudSyncing(false);
+    };
+    const readyFallback = window.setTimeout(() => {
+      if (seenCloud.user) markCloudReady(true);
+    }, 4000);
 
     const applyCloudChats = (deleted: string[], first: boolean, data?: Record<string, any>) => {
       const cloudDeleted = mergeDeletedChatIds(
@@ -839,9 +1056,10 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       setDeletedChatIds(cloudDeleted);
       lastAppliedCloudSessionsRef.current = cloudSessions;
       lastCloudMessageCountRef.current = totalMessages(cloudSessions);
+      const cloudIds = new Set(cloudSessions.map((s) => s.id));
       setChatSessions((prev) => {
         const next = mergeChatSessions(prev, cloudSessions, cloudDeleted).filter(
-          (s) => sessionMessageCount(s) > 0 || s.id === activeSessionIdRef.current
+          (s) => sessionMessageCount(s) > 0 || s.id === activeSessionIdRef.current || cloudIds.has(s.id)
         );
         chatSessionsRef.current = next;
         return sessionsUnchanged(prev, next) ? prev : next;
@@ -875,9 +1093,9 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
             lastSeenCloudUpdatedAtRef.current = data.updatedAt;
           }
 
-          cloudDocSessionsRef.current = Array.isArray(data.chatSessions)
-            ? (data.chatSessions as ChatSession[])
-            : [];
+          const fromDoc = Array.isArray(data.chatSessions) ? (data.chatSessions as ChatSession[]) : [];
+          const fromIndex = sessionsFromChatIndex(data.chatIndex);
+          cloudDocSessionsRef.current = mergeChatSessions(fromIndex, fromDoc, []);
           applyCloudChats(
             Array.isArray(data.deletedChatIds) ? data.deletedChatIds : [],
             first,
@@ -886,23 +1104,57 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
 
           // The backend owns plan + expiry, so always trust the cloud copy —
           // this is how an activated (or expired) subscription reaches the app.
-          if (data.plan) {
-            setUserState((prev) => {
-              if (!prev) return prev;
+          setUserState((prev) => {
+            if (!prev) return prev;
+            const promoKind = data.promoKind === '14d' || data.promoKind === 'forever' ? data.promoKind : undefined;
+            const promoExpiresAt = typeof data.promoExpiresAt === 'number' ? data.promoExpiresAt : undefined;
+            const promoCode = typeof data.promoCode === 'string' ? data.promoCode : undefined;
+            const rejected = promoCode && promoCode === rejectedPromoRef.current;
+            let next = prev;
+            if (data.plan) {
               const nextExpiry = data.subscriptionExpiryDate ?? prev.subscriptionExpiryDate;
-              if (prev.plan === data.plan && prev.subscriptionExpiryDate === nextExpiry) return prev;
-              return { ...prev, plan: data.plan, subscriptionExpiryDate: nextExpiry };
-            });
-          }
+              if (prev.plan !== data.plan || prev.subscriptionExpiryDate !== nextExpiry) {
+                next = { ...next, plan: data.plan as User['plan'], subscriptionExpiryDate: nextExpiry };
+              }
+            }
+            const nextKind = rejected ? undefined : promoKind;
+            const nextExpiryAt = rejected ? undefined : promoExpiresAt;
+            const nextCode = rejected ? undefined : promoCode;
+            if (next.promoKind !== nextKind || next.promoExpiresAt !== nextExpiryAt || next.promoCode !== nextCode) {
+              next = { ...next, promoKind: nextKind, promoExpiresAt: nextExpiryAt, promoCode: nextCode };
+            }
+            return next === prev ? prev : next;
+          });
 
+          if (data.aiUsage && typeof data.aiUsage === 'object') {
+            const usage = data.aiUsage as { month?: string; requests?: number; images?: number; day?: string; dayRequests?: number; monthDrafts?: number };
+            setAiUsage(usage);
+            const month = new Date().toISOString().slice(0, 7);
+            if (usage.month === month && typeof usage.monthDrafts === 'number') {
+              setDraftCount(usage.monthDrafts);
+            }
+          }
+          if (data.addOns && typeof data.addOns === 'object') {
+            setUserState((prev) => (prev ? { ...prev, addOns: data.addOns as Record<string, number | string> } : prev));
+          }
+          if (data.grantedLimits || data.entitlementsVersion || data.paymentStatus || data.billingCycleStart || data.customPlan) {
+            setUserState((prev) => prev ? {
+              ...prev,
+              grantedLimits: data.grantedLimits && typeof data.grantedLimits === 'object' ? data.grantedLimits : prev.grantedLimits,
+              entitlementsVersion: typeof data.entitlementsVersion === 'number' ? data.entitlementsVersion : prev.entitlementsVersion,
+              paymentStatus: typeof data.paymentStatus === 'string' ? data.paymentStatus : prev.paymentStatus,
+              billingCycleStart: typeof data.billingCycleStart === 'number' ? data.billingCycleStart : prev.billingCycleStart,
+              customPlan: data.customPlan && typeof data.customPlan === 'object' ? data.customPlan : prev.customPlan,
+            } : prev);
+          }
           if (first) {
-            if (typeof data.draftCount === 'number') {
+            if (typeof data.draftCount === 'number' && !(data.aiUsage && typeof data.aiUsage.monthDrafts === 'number')) {
               setDraftCount(data.draftCount);
             }
             const cloudDailyDate = data.dailyUseDate;
             const today = todayKey();
             const planAfterLoad = data.plan || user.plan;
-            const unlimited = isUnlimitedEmail(user.email) || isUnlimitedEmail(data.email);
+            const unlimited = hasUnlimitedAccess(user.email, user) || hasUnlimitedAccess(data.email, data);
             const isFreePlan = !unlimited && (!planAfterLoad || planAfterLoad === 'free');
             if (unlimited) {
               setIsTimeUp(false);
@@ -931,8 +1183,35 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
             if (data.lastResetDate !== undefined) {
               setLastResetDate(data.lastResetDate);
             }
-            if (data.language) {
-              setLanguage(data.language);
+            if (typeof data.language === 'string' && data.language) {
+              const cloudAt = typeof data.languageUpdatedAt === 'number' ? data.languageUpdatedAt : 0;
+              const localAt = languageAtRef.current;
+              let chosenHere = false;
+              try { chosenHere = localStorage.getItem('casemate_lang_chosen') === '1'; } catch { /* ignore */ }
+              const keepLocal = chosenHere && localAt >= cloudAt;
+              if (!keepLocal) {
+                languageAtRef.current = Math.max(cloudAt, localAt);
+                try {
+                  localStorage.setItem('casemate_lang', JSON.stringify(data.language));
+                  if (cloudAt > 0) localStorage.setItem('casemate_lang_at', JSON.stringify(cloudAt));
+                } catch { /* ignore */ }
+                setLanguageState(data.language);
+              }
+            }
+            if (data.userMode === 'advocate' || data.userMode === 'judge') {
+              const cloudModeAt = typeof data.userModeUpdatedAt === 'number' ? data.userModeUpdatedAt : 0;
+              const localModeAt = userModeAtRef.current;
+              let modeChosenHere = false;
+              try { modeChosenHere = localStorage.getItem('casemate_user_mode_chosen') === '1'; } catch { /* ignore */ }
+              const keepLocalMode = modeChosenHere && localModeAt >= cloudModeAt;
+              if (!keepLocalMode) {
+                userModeAtRef.current = Math.max(cloudModeAt, localModeAt);
+                try {
+                  localStorage.setItem('casemate_user_mode', JSON.stringify(data.userMode));
+                  if (cloudModeAt > 0) localStorage.setItem('casemate_user_mode_at', JSON.stringify(cloudModeAt));
+                } catch { /* ignore */ }
+                setUserModeState(data.userMode);
+              }
             }
             if (Array.isArray(data.caseLearnings)) {
               setCaseLearnings((prev) => mergeCaseLearnings(prev, data.caseLearnings as CaseLearning[]));
@@ -940,7 +1219,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
             if (data.plan || data.name) {
               setUserState((prev) => prev ? {
                 ...prev,
-                plan: data.plan || prev.plan,
+                plan: (data.plan as User['plan']) || prev.plan,
                 subscriptionExpiryDate: data.subscriptionExpiryDate ?? prev.subscriptionExpiryDate,
                 name: data.name || prev.name,
               } : null);
@@ -951,9 +1230,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
           appliedCloudProfileRef.current = true;
         }
 
-        cloudReadOkRef.current = true;
-        setIsCloudReady(true);
-        setIsCloudSyncing(false);
+        seenCloud.user = true;
+        markCloudReady();
       },
       (error) => {
         console.error("Error fetching cloud data", error);
@@ -967,17 +1245,19 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       (snap) => {
         if (cloudUserIdRef.current !== user.id) return;
         cloudColSessionsRef.current = sessionsFromChatDocs(snap.docs);
-        applyCloudChats(deletedChatIdsRef.current, false);
-        cloudReadOkRef.current = true;
-        setIsCloudReady(true);
-        setIsCloudSyncing(false);
+        applyCloudChats(deletedChatIdsRef.current, !seenCloud.user);
+        seenCloud.col = true;
+        markCloudReady();
       },
       (error) => {
         console.warn('[Firebase] Per-chat collection listen failed', error);
+        seenCloud.col = true;
+        markCloudReady();
       }
     );
 
     return () => {
+      window.clearTimeout(readyFallback);
       unsubUser();
       unsubChats();
     };
@@ -995,10 +1275,12 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
 
     const history = mergeChatSessions(chatSessionsRef.current, [], deletedChatIdsRef.current)
       .filter((s) => sessionMessageCount(s) > 0);
+    const openMode: UserMode = extrasRef.current.userMode === 'judge' ? 'judge' : 'advocate';
+    const modeHistory = history.filter((s) => sessionMode(s) === openMode);
     const savedActive = loadState<string | null>(`casemate_active_session_${user.id}`, null);
     const resumeId =
-      (savedActive && history.some((s) => s.id === savedActive) ? savedActive : null) ||
-      history[0]?.id ||
+      (savedActive && modeHistory.some((s) => s.id === savedActive) ? savedActive : null) ||
+      modeHistory[0]?.id ||
       null;
 
     // Cold start after a full close: open a blank chat immediately.
@@ -1011,6 +1293,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
           title: 'New Case Analysis',
           messages: [],
           updatedAt: Date.now(),
+          userMode: openMode,
         };
         setChatSessions([newSession, ...history]);
         setActiveSessionId(newSession.id);
@@ -1032,7 +1315,10 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       if (!history.length) return;
       if (freshChatOpenedForUserRef.current === user.id) return;
       freshChatOpenedForUserRef.current = `local:${user.id}`;
-      setChatSessions(history);
+      setChatSessions((prev) => {
+        const blank = prev.find((s) => sessionMode(s) === openMode && sessionMessageCount(s) === 0);
+        return blank ? [blank, ...history.filter((s) => s.id !== blank.id)] : history;
+      });
       if (resumeId) setActiveSessionId(resumeId);
       return;
     }
@@ -1056,6 +1342,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       title: 'New Case Analysis',
       messages: [],
       updatedAt: Date.now(),
+      userMode: openMode,
     };
     setChatSessions([newSession, ...history]);
     setActiveSessionId(newSession.id);
@@ -1115,7 +1402,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       void flushChatsToCloudNowRef.current();
     }, 800);
     return () => window.clearTimeout(timeoutId);
-  }, [draftCount, lastResetDate, language, caseLearnings, user?.plan, isCloudReady, authReady, user?.id, user?.role]);
+  }, [draftCount, lastResetDate, language, userMode, caseLearnings, user?.plan, isCloudReady, authReady, user?.id, user?.role]);
 
   useEffect(() => {
     if (!user?.id || !isCloudReady || !authReady || user.role === 'admin') return;
@@ -1161,8 +1448,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
 
   const incrementDraftCount = useCallback(() => {
     const u = userRef.current;
-    if (isUnlimitedEmail(u?.email)) return true;
-    const limit = getPlanLimits(u?.plan, u?.email).draftLimit;
+    if (hasUnlimitedAccess(u?.email, u)) return true;
+    const limit = getPlanLimits(u?.plan, u?.email, u).draftLimit;
     let allowed = true;
     setDraftCount((prev) => {
       if (prev >= limit) {
@@ -1178,10 +1465,15 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     return true;
   }, []);
 
+  const decrementDraftCount = useCallback(() => {
+    setDraftCount((prev) => Math.max(0, prev - 1));
+  }, []);
+
   /** Kept for API compatibility — free tier uses the 1-hour timer instead of per-message uses. */
   const consumeDailyUse = useCallback(() => true, []);
 
   const handleSetUser = useCallback((newUser: User | null) => {
+    newUser = withAdminRole(newUser);
     // Block cloud writes until this user's cloud data is loaded
     setIsCloudReady(false);
     cloudReadOkRef.current = false;
@@ -1204,7 +1496,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       lastAppliedCloudSessionsRef.current = [];
       setActiveSessionId(null);
       setDraftCount(loadState(`casemate_drafts_${newUser.id}`, 0));
-      const unlimited = isUnlimitedEmail(newUser.email);
+      const unlimited = hasUnlimitedAccess(newUser.email, newUser);
       const isFree = !unlimited && (!newUser.plan || newUser.plan === 'free');
       const storedDate = loadState(`casemate_daily_date_${newUser.id}`, todayKey());
       const today = todayKey();
@@ -1250,7 +1542,106 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       console.error("Error signing out of Firebase", e);
     }
     handleSetUser(null);
+  }, [handleSetUser]);
+
+  useEffect(() => {
+    if (!authReady || !user?.id || user.role === 'admin') return;
+    if (auth.currentUser?.uid !== user.id) return;
+    let cancelled = false;
+    void fetchEntitlements().then((snap) => {
+      if (cancelled || !snap?.ok) return;
+      if (snap.addOns) {
+        setUserState((prev) => (prev ? { ...prev, addOns: snap.addOns } : prev));
+      }
+      if (snap.usage) {
+        setAiUsage(snap.usage);
+        const month = new Date().toISOString().slice(0, 7);
+        if (snap.usage.month === month && typeof snap.usage.monthDrafts === 'number') {
+          setDraftCount(snap.usage.monthDrafts);
+        }
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, user?.id, user?.role]);
+
+  useEffect(() => {
+    if (!authReady) return;
+    if (!user?.id) return;
+    const fb = auth.currentUser;
+    if (user.role === 'admin' || isAdminEmail(user.email)) {
+      if (fb && isAdminEmail(fb.email)) {
+        if (user.id !== fb.uid || user.role !== 'admin') {
+          setUserState((prev) =>
+            prev
+              ? { ...prev, id: fb.uid, email: String(fb.email), role: 'admin', plan: prev.plan === 'free' ? 'pro' : prev.plan }
+              : prev
+          );
+        }
+        return;
+      }
+      const timer = window.setTimeout(() => {
+        if (auth.currentUser && isAdminEmail(auth.currentUser.email)) return;
+        handleSetUser(null);
+      }, 1500);
+      return () => window.clearTimeout(timer);
+    }
+    if (authUid === user.id || fb?.uid === user.id) return;
+    const timer = window.setTimeout(() => {
+      if (auth.currentUser?.uid === user.id) return;
+      handleSetUser(null);
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [authReady, authUid, user?.id, user?.role, user?.email, handleSetUser]);
+
+  const redeemPromoCode = useCallback(async (code: string) => {
+    const result = await requestPromoCode(code);
+    if (result.alreadyUnlimited) return result;
+    const u = userRef.current;
+    if (u && result.ok && (result.kind === '14d' || result.kind === 'forever')) {
+      rejectedPromoRef.current = '';
+      setUserState({
+        ...u,
+        promoKind: result.kind,
+        promoExpiresAt: result.expiresAt ?? undefined,
+        promoCode: result.code || code.trim().toUpperCase().replace(/\s+/g, ''),
+      });
+      setIsTimeUp(false);
+      commitUsageSeconds(3600);
+    }
+    return result;
   }, []);
+
+  useEffect(() => {
+    if (!user?.id || user.role === 'admin') return;
+    let cancelled = false;
+    let pending = '';
+    try { pending = sessionStorage.getItem(PENDING_PROMO_KEY) || ''; } catch { /* ignore */ }
+    if (pending) {
+      try { sessionStorage.removeItem(PENDING_PROMO_KEY); } catch { /* ignore */ }
+      void redeemPromoCode(pending).catch((err) => {
+        if (!cancelled) alert(err?.message || 'That promo code is not valid.');
+      });
+    }
+    if (user.promoKind !== 'forever') return () => { cancelled = true; };
+    void fetchPromoStatus().then((status) => {
+      if (cancelled || status.active || status.source === 'email') return;
+      rejectedPromoRef.current = user.promoCode || rejectedPromoRef.current;
+      setUserState((prev) => prev ? { ...prev, promoKind: undefined, promoExpiresAt: undefined, promoCode: undefined } : prev);
+      setIsTimeUp(false);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [user?.id, user?.role, user?.promoKind, user?.promoCode, redeemPromoCode]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    try {
+      if (sessionStorage.getItem(PENDING_CUSTOM_PLAN_KEY)) {
+        setIsSubscriptionModalOpen(true);
+      }
+    } catch { /* ignore */ }
+  }, [user?.id]);
 
   /**
    * Reflect a plan that the backend has already granted after verifying the
@@ -1260,7 +1651,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   const upgradeToPro = useCallback(async (planId: string = 'pro', serverExpiry?: number | null) => {
     const u = userRef.current;
     if (!u) return;
-    const validPlan = (['basic', 'pro', 'annual'].includes(planId) ? planId : 'pro') as User['plan'];
+    const validPlan = (['basic', 'pro', 'annual', 'custom'].includes(planId) ? planId : 'pro') as User['plan'];
     const days = validPlan === 'annual' ? 365 : 30;
     const expiryDate = serverExpiry && serverExpiry > Date.now()
       ? serverExpiry
@@ -1274,23 +1665,18 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
 
   const createNewSession = useCallback(() => {
     const u = userRef.current;
-    if (!isUnlimitedEmail(u?.email) && isTimeUpRef.current && (!u?.plan || u.plan === 'free')) {
-      setIsUpgradeModalOpen(true);
-      return;
-    }
-    const chatLimit = getPlanLimits(u?.plan, u?.email).chatSessionLimit;
+    const chatLimit = getPlanLimits(u?.plan, u?.email, u).chatSessionLimit;
     if (chatSessionsRef.current.length >= chatLimit) {
       setIsSubscriptionModalOpen(true);
       return;
     }
-    const newSession: ChatSession = { id: Date.now().toString(), title: 'New Case Analysis', messages: [], updatedAt: Date.now() };
+    const mode: UserMode = extrasRef.current.userMode === 'judge' ? 'judge' : 'advocate';
+    const newSession: ChatSession = { id: Date.now().toString(), title: 'New Case Analysis', messages: [], updatedAt: Date.now(), userMode: mode };
     setChatSessions((prev) => [newSession, ...prev]);
     setActiveSessionId(newSession.id);
   }, []);
 
   const addMessageToActiveSession = useCallback((message: Message) => {
-    const u = userRef.current;
-    if (!isUnlimitedEmail(u?.email) && isTimeUpRef.current && (!u?.plan || u.plan === 'free')) return;
     const sessionId = activeSessionIdRef.current;
     setChatSessions((prev) => {
       const next = prev.map((session) => {
@@ -1333,8 +1719,6 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const updateMessageFields = useCallback((messageId: string, fields: Partial<Message>) => {
-    const u = userRef.current;
-    if (!isUnlimitedEmail(u?.email) && isTimeUpRef.current && (!u?.plan || u.plan === 'free')) return;
     const sessionId = activeSessionIdRef.current;
     setChatSessions((prev) => {
       const next = prev.map((session) => {
@@ -1358,8 +1742,6 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const trimMessagesAfter = useCallback((messageId: string) => {
-    const u = userRef.current;
-    if (!isUnlimitedEmail(u?.email) && isTimeUpRef.current && (!u?.plan || u.plan === 'free')) return;
     const sessionId = activeSessionIdRef.current;
     setChatSessions((prev) =>
       prev.map((session) => {
@@ -1401,6 +1783,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     };
 
     setChatSessions((prev) => {
+      const removedMode = sessionMode(prev.find((s) => s.id === sessionId) || { id: '', title: '', messages: [], updatedAt: 0 });
       const updated = prev.filter((s) => s.id !== sessionId);
       const wasActive = activeSessionIdRef.current === sessionId;
       if (!wasActive) {
@@ -1408,10 +1791,11 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         persistDelete(updated, activeSessionIdRef.current);
         return updated;
       }
-      if (updated.length > 0) {
+      const sameMode = updated.filter((s) => sessionMode(s) === removedMode);
+      if (sameMode.length > 0) {
         chatSessionsRef.current = updated;
-        queueMicrotask(() => setActiveSessionId(updated[0].id));
-        persistDelete(updated, updated[0].id);
+        queueMicrotask(() => setActiveSessionId(sameMode[0].id));
+        persistDelete(updated, sameMode[0].id);
         return updated;
       }
       const newSession: ChatSession = {
@@ -1419,6 +1803,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         title: 'New Case Analysis',
         messages: [],
         updatedAt: Date.now(),
+        userMode: removedMode,
       };
       const withNew = [newSession];
       chatSessionsRef.current = withNew;
@@ -1429,10 +1814,24 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const renameChatSession = useCallback((sessionId: string, newTitle: string) => {
-    const u = userRef.current;
-    if (!isUnlimitedEmail(u?.email) && isTimeUpRef.current && (!u?.plan || u.plan === 'free')) return;
     setChatSessions((prev) =>
-      prev.map((session) => session.id === sessionId ? { ...session, title: newTitle } : session)
+      prev.map((session) => session.id === sessionId ? { ...session, title: newTitle, updatedAt: Date.now() } : session)
+    );
+  }, []);
+
+  const nameChatFromClient = useCallback((sessionId: string, clientName: string, caseDate?: string | null) => {
+    const cleaned = clientName.trim().replace(/\s+/g, ' ').slice(0, 80);
+    const date = (caseDate || '').trim().slice(0, 40);
+    if (!cleaned && !date) return;
+    setChatSessions((prev) =>
+      prev.map((session) => {
+        if (session.id !== sessionId) return session;
+        const firstUser = session.messages.find((m) => m.role === 'user');
+        const title = cleaned && isAutomaticChatTitle(session.title, firstUser?.text) ? cleaned : session.title;
+        const nextDate = date || session.caseDate;
+        if (title === session.title && nextDate === session.caseDate) return session;
+        return { ...session, title, ...(nextDate ? { caseDate: nextDate } : {}), updatedAt: Date.now() };
+      })
     );
   }, []);
 
@@ -1480,14 +1879,19 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     trimMessagesAfter,
     deleteChatSession,
     renameChatSession,
+    nameChatFromClient,
     usageSeconds,
     subscribeUsageSeconds,
     isTimeUp,
     draftCount,
     incrementDraftCount,
+    decrementDraftCount,
     consumeDailyUse,
+    aiUsage,
     language,
     setLanguage,
+    userMode,
+    setUserMode,
     isSettingsOpen,
     setIsSettingsOpen,
     isSidebarOpen,
@@ -1506,7 +1910,10 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     cloudTemplates,
     caseLearnings,
     upsertCaseLearning,
+    redeemPromoCode,
   }), [
+    userMode,
+    setUserMode,
     user,
     chatSessions,
     activeSessionId,
@@ -1514,6 +1921,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     subscribeUsageSeconds,
     isTimeUp,
     draftCount,
+    decrementDraftCount,
+    aiUsage,
     language,
     isSettingsOpen,
     isSidebarOpen,
@@ -1525,6 +1934,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     subscriptionPlans,
     cloudTemplates,
     caseLearnings,
+    redeemPromoCode,
     createNewSession,
     addMessageToActiveSession,
     updateMessageText,
@@ -1532,7 +1942,9 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     trimMessagesAfter,
     deleteChatSession,
     renameChatSession,
+    nameChatFromClient,
     incrementDraftCount,
+    decrementDraftCount,
     consumeDailyUse,
     upgradeToPro,
     logout,

@@ -10,18 +10,18 @@ import { verifyFirebaseIdToken, projectId } from './firebaseAdmin.js';
 export const firebaseAudience = projectId;
 
 /** @returns {Promise<{uid: string, email: string} | null>} */
-export const verifyRequestUser = async (req) => {
-  if (req.authUser !== undefined) return req.authUser;
+export const verifyRequestUser = async (req, opts = {}) => {
+  if (!opts.checkRevoked && req.authUser !== undefined) return req.authUser;
   const header = String(req.headers.authorization || '');
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
   if (!token) return null;
   try {
-    const decoded = await verifyFirebaseIdToken(token);
+    const decoded = await verifyFirebaseIdToken(token, { checkRevoked: !!opts.checkRevoked });
     const uid = String(decoded.uid || decoded.user_id || decoded.sub || '').trim();
     if (!uid) return null;
     return { uid, email: String(decoded.email || '').trim().toLowerCase() };
   } catch (err) {
-    console.warn('[auth] ID token rejected:', err?.code || err?.message || err);
+    console.warn('[auth] ID token rejected:', err?.code || 'invalid');
     return null;
   }
 };

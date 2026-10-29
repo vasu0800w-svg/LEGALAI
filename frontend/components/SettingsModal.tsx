@@ -1,20 +1,39 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { XIcon } from './Icons';
+import { UserModeSwitch } from './UserModeSwitch';
 import { translations } from '../utils/translations';
+import { APP_LANGUAGES } from '../utils/languages';
 import { userManual } from '../utils/userManual';
 import { auth, sendPasswordReset } from '../services/firebaseService';
+import { getPlanLimits, hasUnlimitedAccess, nextIstMidnightLabel, nextMonthResetLabel, istDateKey } from '../utils/planLimits';
+import { PromoCodeForm } from './PromoCodeForm';
+import { fetchDevices, revokeDevice, RegisteredDevice } from '../services/entitlementsService';
+import { getDeviceId } from '../utils/deviceId';
 import {
   EmailAuthProvider,
   reauthenticateWithCredential,
   updatePassword,
 } from 'firebase/auth';
-const SUPPORT_EMAIL = 'casemateyour@gmail.com';
-const PRIVACY_URL = 'https://legalai-78759.web.app/privacy';
-const DELETION_URL = 'https://legalai-78759.web.app/privacy#data-deletion';
+const SUPPORT_EMAIL = 'meetcasemate@gmail.com';
+const PRIVACY_URL = 'https://meetcasemate.com/privacy';
+const DELETION_URL = 'https://meetcasemate.com/privacy#data-deletion';
+const TERMS_URL = 'https://meetcasemate.com/terms';
+const REFUND_URL = 'https://meetcasemate.com/refund';
 
 export const SettingsModal = () => {
-  const { isSettingsOpen, setIsSettingsOpen, language, setLanguage, user } = useAppContext();
+  const {
+    isSettingsOpen,
+    setIsSettingsOpen,
+    language,
+    setLanguage,
+    user,
+    draftCount,
+    usageSeconds,
+    chatSessions,
+    aiUsage,
+    setIsSubscriptionModalOpen,
+  } = useAppContext();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -23,11 +42,40 @@ export const SettingsModal = () => {
   const [isUpdatingPassword, setIsUpdatingPassword] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [devices, setDevices] = useState<RegisteredDevice[]>([]);
+  const [devicesBusy, setDevicesBusy] = useState(false);
+  const [devicesMsg, setDevicesMsg] = useState('');
+  const t = translations[language] || translations['English'];
+
+  useEffect(() => {
+    if (!isSettingsOpen || !user?.id) return;
+    let cancelled = false;
+    void fetchDevices().then((list) => {
+      if (!cancelled) setDevices(list);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isSettingsOpen, user?.id]);
+
+  const handleRevokeDevice = async (deviceId: string) => {
+    setDevicesBusy(true);
+    setDevicesMsg('');
+    try {
+      const next = await revokeDevice(deviceId);
+      setDevices(next);
+      setDevicesMsg(t.deviceRemoved || 'That device was removed. It can sign in again if a slot is free.');
+    } catch (err: any) {
+      setDevicesMsg(err?.message || 'Could not remove that device.');
+    } finally {
+      setDevicesBusy(false);
+    }
+  };
 
   if (!isSettingsOpen) return null;
-
-  const t = translations[language] || translations['English'];
-  const languages = ['English', 'Hindi'];
 
   const openExternal = (url: string) => {
     // Capacitor WebView launches https URLs via system browser / Custom Tabs
@@ -134,6 +182,15 @@ export const SettingsModal = () => {
             <UserManualBody language={language} t={t} onBack={() => setManualOpen(false)} />
           ) : (
             <>
+          <section>
+            <h3 className="text-sm font-semibold text-band-dim uppercase tracking-wider mb-3">{t.accountProfile || 'Profile'}</h3>
+            <div className="border rounded-xl p-5 border-ink-border bg-ink-muted/70 space-y-2">
+              <p className="text-sm text-white"><span className="text-band-mute">{t.fullName}: </span>{user?.name || '—'}</p>
+              <p className="text-sm text-white break-all"><span className="text-band-mute">{t.email}: </span>{user?.email || '—'}</p>
+              <p className="text-xs text-band-mute mt-2">{t.privacyInfo || 'Chats, uploads, and billing stay on this account. Other users cannot open them.'}</p>
+            </div>
+          </section>
+
           {/* Language Section */}
           <section>
             <h3 className="text-sm font-semibold text-band-dim uppercase tracking-wider mb-3">{t.appLang}</h3>
@@ -143,10 +200,17 @@ export const SettingsModal = () => {
               onChange={(e) => setLanguage(e.target.value)}
               className="w-full p-3 border border-ink-border rounded-xl bg-ink-muted text-white focus:ring-1 focus:ring-white/35 focus:border-white/40 outline-none"
             >
-              {languages.map(lang => (
-                <option key={lang} value={lang}>{lang === 'Hindi' ? 'हिंदी' : lang}</option>
+              {APP_LANGUAGES.map((lang) => (
+                <option key={lang.id} value={lang.id}>{lang.native}</option>
               ))}
             </select>
+          </section>
+
+          {/* Advocate / Judge */}
+          <section>
+            <h3 className="text-sm font-semibold text-band-dim uppercase tracking-wider mb-3">{t.userModeSettingsTitle || 'Profile type'}</h3>
+            <p className="text-sm text-band-mute mb-4">{t.userModeSettingsHint || 'Switching changes only the drafting format and templates. Your chats and plan stay the same.'}</p>
+            <UserModeSwitch />
           </section>
 
           {/* Subscription Section */}
@@ -157,10 +221,12 @@ export const SettingsModal = () => {
               <div className="flex justify-between items-start">
                 <div>
                   <div className="font-bold text-lg text-white capitalize">
-                    {user?.plan || 'Free'} {t.plan}
+                    {hasUnlimitedAccess(user?.email, user) ? 'Unlimited' : (user?.plan || 'Free')} {t.plan}
                   </div>
                   <div className="text-sm text-band-mute mt-1">
-                    {(!user?.plan || user?.plan === 'free') ? t.freeLimit : t.unlimitedAccess}
+                    {user?.promoKind === '14d' && user.promoExpiresAt
+                      ? `Unlimited until ${new Date(user.promoExpiresAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })}`
+                      : hasUnlimitedAccess(user?.email, user) || (user?.plan && user.plan !== 'free') ? t.unlimitedAccess : t.freeLimit}
                   </div>
                 </div>
                 <span className="bg-white/10 text-band border border-ink-border text-xs font-bold px-2.5 py-1 rounded-full uppercase tracking-wide">
@@ -168,6 +234,35 @@ export const SettingsModal = () => {
                 </span>
               </div>
             </div>
+            {!hasUnlimitedAccess(user?.email, user) && (
+              <div className="mt-4">
+                <PromoCodeForm />
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setIsSettingsOpen(false);
+                setIsSubscriptionModalOpen(true);
+              }}
+              className="mt-4 w-full py-3 rounded-xl border border-ink-border bg-ink-muted/70 hover:bg-ink-muted text-white font-medium text-sm transition-colors"
+            >
+              {t.manageSubscription || 'Manage subscription'}
+            </button>
+          </section>
+
+          <section>
+            <h3 className="text-sm font-semibold text-band-dim uppercase tracking-wider mb-3">{t.accountUsage || 'Usage and limits'}</h3>
+            <UsageLimits user={user} draftCount={draftCount} usageSeconds={usageSeconds} chatCount={chatSessions.length} aiUsage={aiUsage} t={t} />
+            <DeviceManager
+              devices={devices}
+              maxDevices={getPlanLimits(user?.plan, user?.email, user).maxDevices}
+              unlimited={hasUnlimitedAccess(user?.email, user)}
+              busy={devicesBusy}
+              message={devicesMsg}
+              onRevoke={handleRevokeDevice}
+              t={t}
+            />
           </section>
 
           {/* Change password */}
@@ -175,32 +270,38 @@ export const SettingsModal = () => {
             <h3 className="text-sm font-semibold text-band-dim uppercase tracking-wider mb-3">{t.changePassword || 'Change password'}</h3>
             <p className="text-sm text-band-mute mb-4">{t.changePasswordHint || 'Update the password for your signed-in account.'}</p>
             <form onSubmit={handleChangePassword} className="space-y-3">
-              <input
-                type="password"
-                required
+              <PasswordRow
+                id="settings-current-password"
+                label={t.currentPassword || 'Current password'}
                 autoComplete="current-password"
-                placeholder={t.currentPassword || 'Current password'}
                 value={currentPassword}
-                onChange={(e) => setCurrentPassword(e.target.value)}
-                className="w-full p-3 border border-ink-border rounded-xl bg-ink-muted text-white text-sm outline-none focus:border-white/40"
+                onChange={setCurrentPassword}
+                visible={showCurrentPassword}
+                onToggle={() => setShowCurrentPassword((open) => !open)}
+                showLabel={t.showPassword || 'Show'}
+                hideLabel={t.hidePassword || 'Hide'}
               />
-              <input
-                type="password"
-                required
+              <PasswordRow
+                id="settings-new-password"
+                label={t.newPassword || 'New password'}
                 autoComplete="new-password"
-                placeholder={t.newPassword || 'New password'}
                 value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                className="w-full p-3 border border-ink-border rounded-xl bg-ink-muted text-white text-sm outline-none focus:border-white/40"
+                onChange={setNewPassword}
+                visible={showNewPassword}
+                onToggle={() => setShowNewPassword((open) => !open)}
+                showLabel={t.showPassword || 'Show'}
+                hideLabel={t.hidePassword || 'Hide'}
               />
-              <input
-                type="password"
-                required
+              <PasswordRow
+                id="settings-confirm-password"
+                label={t.confirmNewPassword || 'Confirm new password'}
                 autoComplete="new-password"
-                placeholder={t.confirmNewPassword || 'Confirm new password'}
                 value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                className="w-full p-3 border border-ink-border rounded-xl bg-ink-muted text-white text-sm outline-none focus:border-white/40"
+                onChange={setConfirmPassword}
+                visible={showConfirmPassword}
+                onToggle={() => setShowConfirmPassword((open) => !open)}
+                showLabel={t.showPassword || 'Show'}
+                hideLabel={t.hidePassword || 'Hide'}
               />
               {passwordError && <p className="text-xs text-red-400">{passwordError}</p>}
               {passwordMsg && <p className="text-xs text-green-400">{passwordMsg}</p>}
@@ -254,6 +355,22 @@ export const SettingsModal = () => {
             </button>
             <button
               type="button"
+              onClick={() => openExternal(TERMS_URL)}
+              className="w-full text-left px-4 py-3 rounded-xl border border-ink-border bg-ink-muted/70 hover:bg-ink-muted transition-colors"
+            >
+              <div className="text-sm font-medium text-white">{t.termsOfUse || 'Terms of use'}</div>
+              <div className="text-xs text-band-mute mt-0.5">{t.viewTerms || 'Draft terms of use (needs legal review)'}</div>
+            </button>
+            <button
+              type="button"
+              onClick={() => openExternal(REFUND_URL)}
+              className="w-full text-left px-4 py-3 rounded-xl border border-ink-border bg-ink-muted/70 hover:bg-ink-muted transition-colors"
+            >
+              <div className="text-sm font-medium text-white">{t.refundPolicy || 'Refunds and billing'}</div>
+              <div className="text-xs text-band-mute mt-0.5">{t.viewRefund || 'Refund and cancellation information (needs legal review)'}</div>
+            </button>
+            <button
+              type="button"
               onClick={() => openExternal(DELETION_URL)}
               className="w-full text-left px-4 py-3 rounded-xl border border-ink-border bg-ink-muted/70 hover:bg-ink-muted transition-colors"
             >
@@ -268,6 +385,178 @@ export const SettingsModal = () => {
     </div>
   );
 };
+
+const shortDeviceId = (id: string) => {
+  if (!id || id.length < 10) return id || 'device';
+  return `${id.slice(0, 6)}…${id.slice(-4)}`;
+};
+
+const DeviceManager = ({
+  devices,
+  maxDevices,
+  unlimited,
+  busy,
+  message,
+  onRevoke,
+  t,
+}: {
+  devices: RegisteredDevice[];
+  maxDevices: number;
+  unlimited: boolean;
+  busy: boolean;
+  message: string;
+  onRevoke: (id: string) => void;
+  t: Record<string, string>;
+}) => {
+  const currentId = getDeviceId();
+  return (
+    <div className="mt-4 border rounded-xl p-5 border-ink-border bg-ink-muted/70 space-y-3">
+      <p className="text-sm font-medium text-white">{t.registeredDevices || 'Registered devices'}</p>
+      <p className="text-xs text-band-mute">
+        {t.devicesManageHint || 'Each install gets a random id stored on this device. Casemate does not fingerprint hardware. Unused slots free after 14 days.'}{' '}
+        {unlimited ? (t.unlimitedLabel || 'Unlimited') : `${devices.length} / ${maxDevices}`}
+      </p>
+      {devices.length === 0 ? (
+        <p className="text-sm text-band-mute">{t.noOtherDevices || 'No other devices are registered yet. This phone is counted the next time you use AI.'}</p>
+      ) : (
+        <ul className="space-y-2">
+          {devices.map((d) => {
+            const current = d.current || d.id === currentId;
+            return (
+              <li key={d.id} className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm text-white">
+                    {shortDeviceId(d.id)}
+                    {current ? ` · ${t.thisDevice || 'This device'}` : ''}
+                  </p>
+                  <p className="text-xs text-band-mute">
+                    {t.lastUsed || 'Last used'} {d.lastSeen ? new Date(d.lastSeen).toLocaleString('en-IN') : '—'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => onRevoke(d.id)}
+                  className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg border border-ink-border text-white hover:bg-ink-muted disabled:opacity-50"
+                >
+                  {t.removeDevice || 'Remove'}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {message ? <p className="text-xs text-band-mute">{message}</p> : null}
+    </div>
+  );
+};
+
+const formatRemain = (seconds: number) => {
+  const safe = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(safe / 60);
+  const rest = safe % 60;
+  return `${minutes}m ${rest}s`;
+};
+
+const UsageLimits = ({
+  user,
+  draftCount,
+  usageSeconds,
+  chatCount,
+  aiUsage,
+  t,
+}: {
+  user: { plan?: string; email?: string; promoKind?: string | null; promoExpiresAt?: number | null } | null | undefined;
+  draftCount: number;
+  usageSeconds: number;
+  chatCount: number;
+  aiUsage: { day?: string; dayRequests?: number } | null;
+  t: Record<string, string>;
+}) => {
+  const unlimited = hasUnlimitedAccess(user?.email, user);
+  const limits = getPlanLimits(user?.plan, user?.email, user);
+  const paid = Boolean(user?.plan && user.plan !== 'free');
+  const drafts = unlimited || !Number.isFinite(limits.draftLimit)
+    ? (t.unlimitedLabel || 'Unlimited')
+    : `${draftCount} / ${limits.draftLimit}`;
+  const chats = unlimited || !Number.isFinite(limits.chatSessionLimit)
+    ? (t.unlimitedLabel || 'Unlimited')
+    : `${chatCount} / ${limits.chatSessionLimit}`;
+  const time = unlimited || paid || !limits.dailySeconds
+    ? (t.noDailyTimer || 'No daily timer on this plan')
+    : formatRemain(usageSeconds);
+  const usedToday = aiUsage?.day === istDateKey() ? Number(aiUsage.dayRequests || 0) : 0;
+  const dailyAi = unlimited || paid || !Number.isFinite(limits.dailyAiRequests)
+    ? (t.unlimitedLabel || 'Unlimited')
+    : `${usedToday} / ${limits.dailyAiRequests}`;
+
+  return (
+    <div className="border rounded-xl p-5 border-ink-border bg-ink-muted/70 space-y-3">
+      <p className="text-sm text-white"><span className="text-band-mute">{t.draftsUsed || 'Drafts this month'}: </span>{drafts}</p>
+      <p className="text-sm text-white"><span className="text-band-mute">{t.dailyAiUsed || 'AI requests today'}: </span>{dailyAi}</p>
+      <p className="text-sm text-white"><span className="text-band-mute">{t.dailyTimeLeft || 'Daily time remaining'}: </span>{time}</p>
+      <p className="text-sm text-white"><span className="text-band-mute">{t.chatsUsed || 'Saved chats'}: </span>{chats}</p>
+      <p className="text-xs text-band-mute">
+        {t.usageResetHint || 'Daily allowances reset at midnight IST'}: {nextIstMidnightLabel()}. {t.monthlyResetHint || 'Drafts and monthly AI reset on'} {nextMonthResetLabel()}.
+      </p>
+      <p className="text-xs text-band-mute">
+        {t.photosPerChat || 'Photos per chat'}: {unlimited || paid ? (t.unlimitedLabel || 'Unlimited') : limits.maxPhotosPerChat}
+      </p>
+      <div className="pt-2 border-t border-ink-border">
+        <p className="text-sm font-medium text-white">{t.registeredDevices || 'Registered devices'}</p>
+        <p className="text-sm text-band-mute mt-1">
+          {t.devicesHint || 'How many devices may use this account at the same time.'}{' '}
+          {unlimited ? (t.unlimitedLabel || 'Unlimited') : `Up to ${limits.maxDevices}`}
+        </p>
+      </div>
+    </div>
+  );
+};
+
+const PasswordRow = ({
+  id,
+  label,
+  autoComplete,
+  value,
+  onChange,
+  visible,
+  onToggle,
+  showLabel,
+  hideLabel,
+}: {
+  id: string;
+  label: string;
+  autoComplete: string;
+  value: string;
+  onChange: (value: string) => void;
+  visible: boolean;
+  onToggle: () => void;
+  showLabel: string;
+  hideLabel: string;
+}) => (
+  <div>
+    <label htmlFor={id} className="block text-xs font-medium text-band-dim mb-1.5">{label}</label>
+    <div className="relative">
+      <input
+        id={id}
+        type={visible ? 'text' : 'password'}
+        required
+        autoComplete={autoComplete}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full p-3 pr-16 border border-ink-border rounded-xl bg-ink-muted text-white text-sm outline-none focus:border-white/40"
+      />
+      <button
+        type="button"
+        onClick={onToggle}
+        className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-band-mute hover:text-white"
+        aria-pressed={visible}
+      >
+        {visible ? hideLabel : showLabel}
+      </button>
+    </div>
+  </div>
+);
 
 const UserManualBody = ({
   language,

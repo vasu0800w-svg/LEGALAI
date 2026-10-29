@@ -9,7 +9,7 @@
  *   GOOGLE_APPLICATION_CREDENTIALS  - path to that JSON file
  *
  * Without them the server stays up: payments are refused (so no money is taken
- * that we cannot honour) and AI fair-use falls back to the per-IP limit.
+ * that we cannot honour) and AI requests are rejected until usage can be recorded.
  */
 import { initializeApp, cert, applicationDefault, getApps } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
@@ -75,8 +75,7 @@ if (db) {
 } else {
   console.warn(
     `[firebase-admin] no credentials (${initError}). ` +
-    'Sign-in verification still works; subscriptions and per-user AI fair-use are disabled. ' +
-    'Set FIREBASE_SERVICE_ACCOUNT on the server to enable both.'
+    'Sign-in verification still works; subscriptions and AI requests stay blocked until FIREBASE_SERVICE_ACCOUNT is set.'
   );
 }
 
@@ -92,9 +91,23 @@ export const paymentDoc = (paymentId) => db.collection('payments').doc(String(pa
  * Verify a Firebase ID token. Works without a service account because it only
  * needs the project id and Google's public securetoken certificates.
  */
-export const verifyFirebaseIdToken = async (idToken) => {
+export const verifyFirebaseIdToken = async (idToken, opts = {}) => {
   if (!app) throw new Error('Firebase Admin app not initialised');
-  return getAuth(app).verifyIdToken(idToken);
+  return getAuth(app).verifyIdToken(idToken, !!opts.checkRevoked);
+};
+
+/** Off unless APP_CHECK_ENFORCE=1 after App Check is configured and the client sends tokens. */
+export const verifyAppCheckIfEnforced = async (req) => {
+  if (String(process.env.APP_CHECK_ENFORCE || '') !== '1') return true;
+  const token = String(req?.headers?.['x-firebase-appcheck'] || '').trim();
+  if (!token || !app) return false;
+  try {
+    const { getAppCheck } = await import('firebase-admin/app-check');
+    await getAppCheck(app).verifyToken(token);
+    return true;
+  } catch {
+    return false;
+  }
 };
 
 /** Inbox email uses this link. The continue page must be an authorized domain. */

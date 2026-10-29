@@ -1,5 +1,8 @@
-import React from 'react';
+import React, { lazy, Suspense, useEffect, useState } from 'react';
+import { Capacitor } from '@capacitor/core';
+import { StatusBar, Style } from '@capacitor/status-bar';
 import { useAppContext } from './context/AppContext';
+import { bumpSiteStat } from './services/siteStatsService';
 import { AuthScreen } from './components/AuthScreen';
 import { Sidebar } from './components/Sidebar';
 import { ChatArea } from './components/ChatArea';
@@ -9,6 +12,13 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { SubscriptionModal } from './components/SubscriptionModal';
 import { MockRazorpay } from './components/MockRazorpay';
 import { useNativeAppNavigation } from './utils/nativeNavigation';
+import { THEME_INK_DARK } from './utils/theme';
+
+const packagedForAndroid = import.meta.env.VITE_APP_TARGET === 'android';
+
+const LandingPage = packagedForAndroid
+  ? null
+  : lazy(() => import('./components/LandingPage').then((m) => ({ default: m.LandingPage })));
 
 const AppShell = () => {
   const {
@@ -65,9 +75,40 @@ const AppShell = () => {
 
 const App = () => {
   const { user } = useAppContext();
+  const [authMode, setAuthMode] = useState<'login' | 'signup' | null>(null);
+
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+    void StatusBar.setStyle({ style: Style.Dark }).catch(() => {});
+    void StatusBar.setBackgroundColor({ color: THEME_INK_DARK }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const day = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const key = 'casemate_visit_day';
+    try {
+      if (localStorage.getItem(key) === day) return;
+    } catch {
+      return;
+    }
+    void bumpSiteStat('visits').then((ok) => {
+      if (!ok) return;
+      try { localStorage.setItem(key, day); } catch { /* ignore */ }
+    });
+  }, []);
 
   if (!user) {
-    return <AuthScreen />;
+    if (packagedForAndroid || Capacitor.isNativePlatform() || !LandingPage) {
+      return <AuthScreen />;
+    }
+    if (!authMode) {
+      return (
+        <Suspense fallback={<div className="h-full w-full bg-ink" aria-busy="true" aria-label="Loading Casemate" />}>
+          <LandingPage onSignIn={() => setAuthMode('login')} onStart={() => setAuthMode('signup')} />
+        </Suspense>
+      );
+    }
+    return <AuthScreen startInSignup={authMode === 'signup'} onBack={() => setAuthMode(null)} />;
   }
 
   if (user.role === 'admin') {

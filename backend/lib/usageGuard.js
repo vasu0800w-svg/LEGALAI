@@ -11,16 +11,15 @@
  * reservation so they do not consume quota. Concurrent reserves run in a
  * Firestore transaction so two in-flight drafts cannot both sneak past the cap.
  *
- * Fails open when Firebase Admin is not configured, so the app keeps working.
+ * Fails closed when Firebase Admin or usage writes are unavailable so AI
+ * spend cannot run without a recorded quota check.
  */
 import { adminReady, getDb, userDoc } from './firebaseAdmin.js';
 import { getPlanLimits, loadFreePlanLimits, istDateKey } from '../middleware/planLimits.js';
 import { loadPromoCodes } from './promoCodes.js';
 import { seedMonthDrafts } from './entitlementMath.js';
-
-/** A device slot is released after this many days without use. */
-const DEVICE_STALE_DAYS = 14;
-const DEVICE_STALE_MS = DEVICE_STALE_DAYS * 24 * 60 * 60 * 1000;
+import { usageUnavailable } from './usagePolicy.js';
+import { DEVICE_STALE_DAYS, DEVICE_STALE_MS, decideAiReservation } from './usageDecision.js';
 
 const monthKey = (now = new Date()) => now.toISOString().slice(0, 7);
 
@@ -84,7 +83,14 @@ const writeUsage = (tx, ref, prev, extra = {}) => {
  * @returns {Promise<{ok: true, skipped?: boolean} | {ok: false, code: string, message: string}>}
  */
 export const reserveAiRequest = async ({ uid, email, deviceId, contents }) => {
-  if (!adminReady()) return { ok: true, skipped: true };
+  if (!adminReady()) return usageUnavailable();
+  if (!deviceId) {
+    return {
+      ok: false,
+      code: 'DEVICE_REQUIRED',
+      message: 'This app install could not be verified. Please reopen Casemate and try again.',
+    };
+  }
 
   await loadFreePlanLimits().catch(() => null);
   const db = getDb();
@@ -103,70 +109,22 @@ export const reserveAiRequest = async ({ uid, email, deviceId, contents }) => {
       const plan = effectivePlan(data);
       const limits = getPlanLimits(plan, email || data.email, data, codes);
       const prev = usageSnapshot(data, month, day, nowDate);
+      const decision = decideAiReservation({
+        prev,
+        limits,
+        images,
+        devices: data.devices,
+        deviceId,
+        now,
+      });
+      if (!decision.ok) return decision;
 
-      if (Number.isFinite(limits.maxPhotosPerUpload) && images > limits.maxPhotosPerUpload) {
-        return {
-          ok: false,
-          code: 'UPLOAD_PHOTO_LIMIT',
-          message: `You can send up to ${limits.maxPhotosPerUpload} photos in one request.`,
-        };
-      }
-      if (Number.isFinite(limits.dailyAiRequests) && prev.dayRequests + 1 > limits.dailyAiRequests) {
-        return {
-          ok: false,
-          code: 'FAIR_USE_DAILY',
-          message: `You have used today's ${limits.dailyAiRequests} AI requests on the Free plan. The allowance resets at midnight IST. Your chats and uploads are saved.`,
-        };
-      }
-      if (prev.requests + 1 > limits.monthlyAiRequests) {
-        return {
-          ok: false,
-          code: 'FAIR_USE_REQUESTS',
-          message: 'You have reached this month\'s fair-use limit for AI requests. It resets on the 1st. Your chats and uploads are saved.',
-        };
-      }
-      if (images > 0 && prev.images + images > limits.monthlyImages) {
-        return {
-          ok: false,
-          code: 'FAIR_USE_IMAGES',
-          message: 'You have reached this month\'s fair-use limit for photo analysis. It resets on the 1st. Your chats and uploads are saved.',
-        };
-      }
-
-      // Device slots. Older app builds send no device id — those are not blocked.
-      let devices = Array.isArray(data.devices) ? data.devices.slice(0, 50) : [];
-      if (deviceId) {
-        const fresh = devices.filter(
-          (d) => d && d.id && (now - Number(d.lastSeen || 0)) < DEVICE_STALE_MS
-        );
-        const mine = fresh.find((d) => d.id === deviceId);
-        if (mine) {
-          mine.lastSeen = now;
-          devices = fresh;
-        } else if (fresh.length >= limits.maxDevices) {
-          return {
-            ok: false,
-            code: 'DEVICE_LIMIT',
-            message: `This account is already in use on ${limits.maxDevices} devices. Sign out on another device, or wait ${DEVICE_STALE_DAYS} days for an unused one to free up.`,
-          };
-        } else {
-          devices = [...fresh, { id: deviceId, lastSeen: now }];
-        }
-      }
-
-      writeUsage(tx, ref, {
-        ...prev,
-        requests: prev.requests + 1,
-        images: prev.images + images,
-        dayRequests: prev.dayRequests + 1,
-      }, deviceId ? { devices } : {});
-
+      writeUsage(tx, ref, decision.next, { devices: decision.devices });
       return { ok: true };
     });
   } catch (err) {
-    // Never block a paying user because our own bookkeeping failed.
-    console.warn('[usageGuard] could not record usage:', err?.message || err);
-    return { ok: true, skipped: true };
+    console.warn('[usageGuard] could not record usage:', err?.code || err?.message || 'failed');
+    return usageUnavailable();
   }
 };
 
@@ -203,7 +161,7 @@ export const releaseAiRequest = async ({ uid, contents }) => {
  * Must be paired with releaseDraft if generation fails.
  */
 export const reserveDraft = async ({ uid, email }) => {
-  if (!adminReady()) return { ok: true, skipped: true };
+  if (!adminReady()) return usageUnavailable();
   await loadFreePlanLimits().catch(() => null);
   const now = Date.now();
   const nowDate = new Date(now);
@@ -236,8 +194,8 @@ export const reserveDraft = async ({ uid, email }) => {
       return { ok: true, monthDrafts: nextDrafts, remaining: Number.isFinite(limits.draftLimit) ? Math.max(0, limits.draftLimit - nextDrafts) : null };
     });
   } catch (err) {
-    console.warn('[usageGuard] could not reserve draft:', err?.message || err);
-    return { ok: true, skipped: true };
+    console.warn('[usageGuard] could not reserve draft:', err?.code || err?.message || 'failed');
+    return usageUnavailable();
   }
 };
 

@@ -2,25 +2,22 @@ import { verifyRequestUser } from '../lib/authUser.js';
 import { adminReady, userDoc } from '../lib/firebaseAdmin.js';
 import { isUnlimitedEmail } from '../middleware/planLimits.js';
 import { PROMO_14_MS, isPromoActive, loadPromoCodes, normalizePromoCode } from '../lib/promoCodes.js';
+import { applyCors } from '../lib/httpSecurity.js';
 
-const cors = (res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-};
+const cors = (req, res) => applyCors(req, res, 'POST, OPTIONS');
 
 export function promoOptionsHandler(req, res) {
-  cors(res);
+  cors(req, res);
   res.status(204).end();
 }
 
 export async function redeemPromoHandler(req, res) {
-  cors(res);
+  cors(req, res);
   if (!adminReady()) {
     return res.status(503).json({ error: 'UNAVAILABLE', message: 'Promo codes are not available right now.' });
   }
 
-  const authUser = await verifyRequestUser(req);
+  const authUser = await verifyRequestUser(req, { checkRevoked: true });
   if (!authUser?.uid) {
     return res.status(401).json({ error: 'AUTH', message: 'Sign in, then enter the promo code.' });
   }
@@ -65,7 +62,7 @@ export async function redeemPromoHandler(req, res) {
 }
 
 export async function promoStatusHandler(req, res) {
-  cors(res);
+  cors(req, res);
   const authUser = await verifyRequestUser(req);
   if (!authUser?.uid) {
     return res.status(401).json({ error: 'AUTH', message: 'Sign in required.' });

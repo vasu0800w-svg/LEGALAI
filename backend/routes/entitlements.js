@@ -10,15 +10,12 @@ import { loadPlanCatalog, billingWindow, isChatLimitAddon } from '../lib/planCat
 import { loadPromoCodes, isPromoActive } from '../lib/promoCodes.js';
 import { effectivePlan, listDevices, revokeDevice } from '../lib/usageGuard.js';
 import { remainingOf, seedMonthDrafts, CATALOG_VERSION, activeExtraSessionChars } from '../lib/entitlementMath.js';
+import { applyCors } from '../lib/httpSecurity.js';
 
-const cors = (res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Id');
-};
+const cors = (req, res) => applyCors(req, res, 'GET, POST, OPTIONS');
 
-export function entitlementsOptionsHandler(_req, res) {
-  cors(res);
+export function entitlementsOptionsHandler(req, res) {
+  cors(req, res);
   res.status(204).end();
 }
 
@@ -34,7 +31,7 @@ const requireUser = async (req, res) => {
 };
 
 export async function entitlementsHandler(req, res) {
-  cors(res);
+  cors(req, res);
   const authUser = await requireUser(req, res);
   if (!authUser) return;
 
@@ -147,7 +144,7 @@ export async function entitlementsHandler(req, res) {
 }
 
 export async function devicesHandler(req, res) {
-  cors(res);
+  cors(req, res);
   const authUser = await requireUser(req, res);
   if (!authUser) return;
   if (!adminReady()) {
@@ -165,7 +162,7 @@ export async function devicesHandler(req, res) {
 }
 
 export async function revokeDeviceHandler(req, res) {
-  cors(res);
+  cors(req, res);
   const authUser = await requireUser(req, res);
   if (!authUser) return;
   const deviceId = String(req.body?.deviceId || '').trim().slice(0, 64);

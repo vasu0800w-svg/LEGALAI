@@ -7,13 +7,14 @@ import { StatusBar, Style } from '@capacitor/status-bar';
 import { SplashScreen } from '@capacitor/splash-screen';
 import App from './App';
 import { AppProvider } from './context/AppContext';
+import { lockOriginalAppearance, THEME_INK_DARK } from './utils/theme';
 
 async function initNativeShell() {
   if (!Capacitor.isNativePlatform()) return;
   try {
     await StatusBar.setOverlaysWebView({ overlay: false });
     await StatusBar.setStyle({ style: Style.Dark });
-    await StatusBar.setBackgroundColor({ color: '#0a0a0a' });
+    await StatusBar.setBackgroundColor({ color: THEME_INK_DARK });
   } catch (e) {
     console.info('StatusBar unavailable', e);
   }
@@ -38,4 +39,5 @@ root.render(
   </React.StrictMode>
 );
 
+lockOriginalAppearance();
 initNativeShell();

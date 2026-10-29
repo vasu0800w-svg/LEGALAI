@@ -9,16 +9,22 @@ export default {
     extend: {
       colors: {
         ink: {
-          DEFAULT: '#0a0a0a',
-          soft: '#121212',
-          muted: '#1a1a1a',
-          border: '#2e2e2e',
+          DEFAULT: 'var(--ink)',
+          soft: 'var(--ink-soft)',
+          muted: 'var(--ink-muted)',
+          border: 'var(--ink-border)',
         },
         band: {
-          DEFAULT: '#f5f5f5',
-          dim: '#c9c9c9',
-          mute: '#8a8a8a',
+          DEFAULT: 'var(--band)',
+          dim: 'var(--band-dim)',
+          mute: 'var(--band-mute)',
         },
+      },
+      borderRadius: {
+        cm: 'var(--radius-md)',
+      },
+      boxShadow: {
+        cm: 'var(--shadow-card)',
       },
       fontFamily: {
         display: ['"Cormorant Garamond"', 'Georgia', 'serif'],

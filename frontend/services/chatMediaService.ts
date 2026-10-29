@@ -15,12 +15,45 @@ const resolveMimeType = (file: File): string => {
   if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
   if (name.endsWith('.webp')) return 'image/webp';
   if (name.endsWith('.gif')) return 'image/gif';
+  if (name.endsWith('.heic')) return 'image/heic';
+  if (name.endsWith('.heif')) return 'image/heif';
   if (name.endsWith('.txt')) return 'text/plain';
+  if (name.endsWith('.rtf')) return 'text/rtf';
   if (name.endsWith('.docx')) {
     return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   }
   if (name.endsWith('.doc')) return 'application/msword';
   return 'application/octet-stream';
+};
+
+/** Largest file the AI request can carry (a request body is capped near 20 MB, base64 adds a third). */
+const MAX_DOC_UPLOAD_BYTES = 10 * 1024 * 1024;
+/** Photos are shrunk before sending, so a bigger original is fine. */
+const MAX_IMAGE_UPLOAD_BYTES = 40 * 1024 * 1024;
+
+/**
+ * Catch a file that can never be analysed before the advocate waits for it.
+ * Returns a message to show, or null when the file is fine.
+ */
+export const validateUploadFile = (file: File, language: string): string | null => {
+  const hi = language === 'Hindi';
+  if (!file || file.size <= 0) {
+    return hi ? `"${file?.name || 'फ़ाइल'}" खाली है। कृपया सही फ़ाइल चुनें।` : `"${file?.name || 'File'}" is empty. Please pick a valid file.`;
+  }
+  const mime = resolveMimeType(file);
+  const isImage = mime.startsWith('image/');
+  if (mime === 'application/octet-stream') {
+    return hi
+      ? `"${file.name}" इस प्रकार की फ़ाइल समर्थित नहीं है। PDF, DOCX, DOC, TXT, RTF या फ़ोटो (JPG/PNG) अपलोड करें।`
+      : `"${file.name}" is not a supported file type. Upload a PDF, DOCX, DOC, TXT, RTF or a photo (JPG/PNG).`;
+  }
+  if (isImage ? file.size > MAX_IMAGE_UPLOAD_BYTES : file.size > MAX_DOC_UPLOAD_BYTES) {
+    const mb = Math.round((isImage ? MAX_IMAGE_UPLOAD_BYTES : MAX_DOC_UPLOAD_BYTES) / 1048576);
+    return hi
+      ? `"${file.name}" बहुत बड़ी है (अधिकतम ${mb} MB)। फ़ाइल को कम पन्नों में बाँटकर अपलोड करें।`
+      : `"${file.name}" is too large (max ${mb} MB). Split it into fewer pages and upload again.`;
+  }
+  return null;
 };
 
 const isImageFile = (file: File): boolean =>
@@ -140,7 +173,11 @@ export const prepareFilesForAi = async (files: File[], opts?: CompressOpts): Pro
 };
 
 const safeFileName = (name: string): string =>
-  name.replace(/[^\w.\-()+ ]+/g, '_').slice(0, 120);
+  name
+    .replace(/\.\./g, '_')
+    .replace(/[\\/]/g, '_')
+    .replace(/[^\w.\-()+ ]+/g, '_')
+    .slice(0, 120);
 
 export type UploadProgress = (done: number, total: number, fileName: string) => void;
 
@@ -208,6 +245,8 @@ export const uploadPreparedAttachments = async (
       const storageRef = ref(storage, path);
       const tryUpload = async () => {
         await uploadBytes(storageRef, prepared, { contentType: mimeType });
+        // Tokenized download URLs are long-lived; Storage rules still require
+        // the owner to mint a new URL. Existing chats keep working as before.
         return getDownloadURL(storageRef);
       };
       let url: string;

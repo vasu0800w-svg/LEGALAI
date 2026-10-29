@@ -17,9 +17,13 @@ export default defineConfig(({ mode }) => {
       proxy: {
         '/api-proxy': 'http://127.0.0.1:5000',
         '/api/validate-chat-limits': 'http://127.0.0.1:5000',
+        '/api/entitlements': 'http://127.0.0.1:5000',
+        '/api/devices': 'http://127.0.0.1:5000',
         '/api/create-order': 'http://127.0.0.1:5000',
         '/api/verify-payment': 'http://127.0.0.1:5000',
         '/api/gemini': 'http://127.0.0.1:5000',
+        '/api/custom-plan': 'http://127.0.0.1:5000',
+        '/api/admin': 'http://127.0.0.1:5000',
         '/ws-proxy': { target: 'ws://127.0.0.1:5000', ws: true },
       },
     },

@@ -1,14 +1,11 @@
 import { verifyRequestUser } from '../lib/authUser.js';
 import { adminReady, createEmailVerificationLink } from '../lib/firebaseAdmin.js';
+import { applyCors } from '../lib/httpSecurity.js';
 
-const cors = (res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-};
+const cors = (req, res) => applyCors(req, res, 'POST, OPTIONS');
 
-export const verificationLinkOptionsHandler = (_req, res) => {
-  cors(res);
+export const verificationLinkOptionsHandler = (req, res) => {
+  cors(req, res);
   res.status(204).end();
 };
 
@@ -17,8 +14,8 @@ export const verificationLinkOptionsHandler = (_req, res) => {
  * The raw Firebase verification mail is not sent, so the link is not stuck in spam.
  */
 export const verificationLinkHandler = async (req, res) => {
-  cors(res);
-  const user = await verifyRequestUser(req);
+  cors(req, res);
+  const user = await verifyRequestUser(req, { checkRevoked: true });
   if (!user?.uid || !user.email) {
     return res.status(401).json({ error: 'AUTH', message: 'Sign in required.' });
   }

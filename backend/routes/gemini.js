@@ -7,7 +7,11 @@
  */
 import { GoogleGenAI } from '@google/genai';
 import { verifyRequestUser } from '../lib/authUser.js';
+import { verifyAppCheckIfEnforced } from '../lib/firebaseAdmin.js';
 import { reserveAiRequest, releaseAiRequest, reserveDraft, releaseDraft } from '../lib/usageGuard.js';
+import { applyCors } from '../lib/httpSecurity.js';
+import { parseDeviceId } from '../lib/devicePolicy.js';
+import { sanitizeGeminiRequest, DEFAULT_GEMINI_MODEL } from '../lib/geminiPolicy.js';
 
 const DEFAULT_MODEL = 'gemini-3.8-flash';
 const UPSTREAM_TIMEOUT_MS = 80000;
@@ -19,11 +23,7 @@ const HEARTBEAT_MS = 10000;
 /** A retry is only worth it when the first try failed fast (overload, reset). */
 const RETRY_ONLY_IF_FASTER_THAN_MS = 20000;
 
-const cors = (res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Id, X-Work-Kind, X-Keepalive, X-Max-Wait-Ms');
-};
+const cors = (req, res) => applyCors(req, res, 'POST, OPTIONS');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -114,6 +114,9 @@ const toSdkConfig = (config, model, waitMs = UPSTREAM_TIMEOUT_MS) => {
   }
   if (typeof config?.temperature === 'number') out.temperature = config.temperature;
 
+  // A JSON-only answer is used by the template filler; no other response options pass through.
+  if (config?.responseMimeType === 'application/json') out.responseMimeType = 'application/json';
+
   // Only live web search is allowed through; clients cannot request other tools.
   if (Array.isArray(config?.tools) && config.tools.some((t) => t && t.googleSearch)) {
     out.tools = [{ googleSearch: {} }];
@@ -156,19 +159,32 @@ const extractSources = (response) => {
 };
 
 export function geminiOptionsHandler(req, res) {
-  cors(res);
+  cors(req, res);
   res.status(204).end();
 }
 
 export async function geminiHandler(req, res) {
-  cors(res);
+  cors(req, res);
 
-  const requireAuth = process.env.GEMINI_REQUIRE_AUTH !== '0';
   const authUser = await verifyRequestUser(req);
-  if (requireAuth && !authUser) {
+  if (!authUser) {
     return res.status(401).json({
       error: 'UNAUTHENTICATED',
       message: 'Sign in required for AI requests.',
+    });
+  }
+  if (!(await verifyAppCheckIfEnforced(req))) {
+    return res.status(401).json({
+      error: 'UNAUTHENTICATED',
+      message: 'Sign in required for AI requests.',
+    });
+  }
+
+  const deviceId = parseDeviceId(req.headers['x-device-id']);
+  if (!deviceId) {
+    return res.status(400).json({
+      error: 'DEVICE_REQUIRED',
+      message: 'This app install could not be verified. Please reopen Casemate and try again.',
     });
   }
 
@@ -176,45 +192,51 @@ export async function geminiHandler(req, res) {
   if (!ai) {
     return res.status(503).json({
       error: 'GEMINI_NOT_CONFIGURED',
-      message: 'Gemini API key is not configured on the server.',
+      message: 'The assistant is temporarily unavailable.',
     });
   }
 
-  const model = String(req.body?.model || DEFAULT_MODEL).slice(0, 80);
-  const contents = req.body?.contents;
-  if (!contents) {
-    return res.status(400).json({ error: 'MISSING_CONTENTS', message: 'contents is required.' });
+  const sanitized = sanitizeGeminiRequest(req.body);
+  if (!sanitized.ok) {
+    return res.status(400).json({ error: sanitized.code, message: sanitized.message });
   }
+  const model = sanitized.model || DEFAULT_GEMINI_MODEL;
+  const contents = sanitized.contents;
 
   let reserved = false;
   let reservedDraft = false;
   const workKind = String(req.headers['x-work-kind'] || req.body?.workKind || 'analysis').toLowerCase();
-  if (authUser) {
-    const reservation = await reserveAiRequest({
-      uid: authUser.uid,
-      email: authUser.email,
-      deviceId: String(req.headers['x-device-id'] || '').slice(0, 64) || null,
-      contents,
+  const reservation = await reserveAiRequest({
+    uid: authUser.uid,
+    email: authUser.email,
+    deviceId,
+    contents,
+  });
+  if (!reservation.ok) {
+    const status = reservation.code === 'USAGE_UNAVAILABLE'
+      ? 503
+      : reservation.code === 'DEVICE_REQUIRED'
+        ? 400
+        : reservation.code === 'DEVICE_LIMIT' || reservation.code === 'UPLOAD_PHOTO_LIMIT'
+          ? 403
+          : 429;
+    return res.status(status).json({
+      error: reservation.code,
+      message: reservation.message,
     });
-    if (!reservation.ok) {
-      const status = reservation.code === 'DEVICE_LIMIT' || reservation.code === 'UPLOAD_PHOTO_LIMIT' ? 403 : 429;
+  }
+  reserved = true;
+  if (workKind === 'draft') {
+    const draft = await reserveDraft({ uid: authUser.uid, email: authUser.email });
+    if (!draft.ok) {
+      await releaseAiRequest({ uid: authUser.uid, contents }).catch(() => {});
+      const status = draft.code === 'USAGE_UNAVAILABLE' ? 503 : 429;
       return res.status(status).json({
-        error: reservation.code,
-        message: reservation.message,
+        error: draft.code,
+        message: draft.message,
       });
     }
-    reserved = !reservation.skipped;
-    if (workKind === 'draft') {
-      const draft = await reserveDraft({ uid: authUser.uid, email: authUser.email });
-      if (!draft.ok) {
-        if (reserved) await releaseAiRequest({ uid: authUser.uid, contents }).catch(() => {});
-        return res.status(429).json({
-          error: draft.code,
-          message: draft.message,
-        });
-      }
-      reservedDraft = !draft.skipped;
-    }
+    reservedDraft = true;
   }
 
   // A client that is willing to wait longer says so; short calls stay short so
@@ -248,11 +270,10 @@ export async function geminiHandler(req, res) {
   const request = {
     model,
     contents: toSdkContents(contents),
-    config: toSdkConfig(req.body?.config, model, waitMs),
+    config: toSdkConfig(sanitized.config, model, waitMs),
   };
 
   let lastStatus = 502;
-  let lastMessage = 'Gemini request failed';
 
   let timedOut = false;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -265,7 +286,6 @@ export async function geminiHandler(req, res) {
       });
     } catch (err) {
       lastStatus = errStatus(err) || 502;
-      lastMessage = String(err?.message || 'Gemini request failed');
       timedOut = isTimeoutError(err);
       const fastFailure = Date.now() - startedAt < RETRY_ONLY_IF_FASTER_THAN_MS;
       if (!isRetryableError(err) || attempt === 1 || !fastFailure) break;
@@ -280,15 +300,15 @@ export async function geminiHandler(req, res) {
     await releaseDraft({ uid: authUser.uid }).catch(() => {});
   }
 
-  console.error('[gemini] upstream failed:', lastStatus, String(lastMessage).slice(0, 180));
+  console.error('[gemini] upstream failed:', lastStatus);
   if (timedOut) {
     return reply(504, {
       error: 'GEMINI_TIMEOUT',
       message: 'The AI took too long on this request.',
     });
   }
-  return reply(lastStatus >= 400 ? lastStatus : 502, {
+  return reply(lastStatus >= 400 && lastStatus < 600 ? lastStatus : 502, {
     error: 'GEMINI_FAILED',
-    message: lastMessage.slice(0, 180),
+    message: 'The assistant could not complete this request. Please try again.',
   });
 }

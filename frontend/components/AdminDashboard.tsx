@@ -1,10 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { UsersIcon, ActivityIcon, LogoutIcon, SettingsIcon, XIcon, EditIcon, PlusIcon } from './Icons';
+import { LogoutIcon, SettingsIcon, XIcon, EditIcon, PlusIcon } from './Icons';
 import { BrandLogo } from './BrandLogo';
 import { translations } from '../utils/translations';
-import { saveAppConfig, getAppConfig, saveCloudAdminConfig, saveAppConfigDetailed, CloudLegalTemplate, ensureConfigWriteAuth } from '../services/adminConfigService';
-import { PLAN_FEATURES, DEFAULT_PLAN_PRICES, sanitizeSubscriptionPlans } from '../utils/planLimits';
+import { EmailAuthProvider, reauthenticateWithCredential, updatePassword } from 'firebase/auth';
+import { auth } from '../services/firebaseService';
+import { saveAppConfig, getAppConfig, saveCloudAdminConfig, saveAppConfigDetailed, CloudLegalTemplate, ensureConfigWriteAuth, verifyAdminSession } from '../services/adminConfigService';
+import { ADMIN_EMAIL } from '../utils/adminIdentity';
+import { PLAN_FEATURES, DEFAULT_PLAN_PRICES, UNLIMITED_EMAIL_LIST, isUnlimitedEmail, sanitizeSubscriptionPlans, sanitizeFreePlanLimits, DEFAULT_FREE_PLAN_LIMITS, applyFreePlanConfig, PlanLimits } from '../utils/planLimits';
+import { subscribeUserDirectory, DirectoryUser } from '../services/userDirectoryService';
+import { subscribeSiteStats, SiteStats } from '../services/siteStatsService';
 import { PREDEFINED_TEMPLATES } from '../utils/templates';
 
 interface UserStats {
@@ -12,10 +17,8 @@ interface UserStats {
   name: string;
   email: string;
   plan: string;
-  totalChats: number;
-  totalDocs: number;
-  timeLeft: number;
-  isBlocked?: boolean;
+  lastSeen: number;
+  createdAt: number;
 }
 
 interface PlanConfig {
@@ -29,6 +32,15 @@ export const AdminDashboard = () => {
   const { logout, language } = useAppContext();
   const t = translations[language] || translations['English'];
   const [stats, setStats] = useState<UserStats[]>([]);
+  const [siteStats, setSiteStats] = useState<SiteStats>({ visits: 0, logins: 0, signups: 0 });
+  const [siteStatsError, setSiteStatsError] = useState('');
+  const [directoryError, setDirectoryError] = useState('');
+  const [directoryReady, setDirectoryReady] = useState(false);
+  const [promo14, setPromo14] = useState('');
+  const [promoAlways, setPromoAlways] = useState('');
+  const [promoNote, setPromoNote] = useState('');
+  const [promoSaving, setPromoSaving] = useState(false);
+  const [nowTick, setNowTick] = useState(() => Date.now());
   const [showSettings, setShowSettings] = useState(false);
   const [showPlansModal, setShowPlansModal] = useState(false);
   const [showKeysModal, setShowKeysModal] = useState(false);
@@ -36,15 +48,20 @@ export const AdminDashboard = () => {
   const [showTemplatesModal, setShowTemplatesModal] = useState(false);
   const [isSavingCloud, setIsSavingCloud] = useState(false);
 
-  const [adminEmail, setAdminEmail] = useState('');
-  const [adminPassword, setAdminPassword] = useState('');
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordError, setPasswordError] = useState('');
+  const [passwordMsg, setPasswordMsg] = useState('');
+  const [isUpdatingPassword, setIsUpdatingPassword] = useState(false);
 
   // Dynamic Plans with customizable features & add/remove support
   const [plans, setPlans] = useState<PlanConfig[]>([
-    { id: 'basic', name: 'Basic Plan', price: DEFAULT_PLAN_PRICES.basic, features: [...PLAN_FEATURES.basic] },
-    { id: 'pro', name: 'Pro Plan', price: DEFAULT_PLAN_PRICES.pro, features: [...PLAN_FEATURES.pro] },
+    { id: 'basic', name: 'Casemate Basic', price: DEFAULT_PLAN_PRICES.basic, features: [...PLAN_FEATURES.basic] },
+    { id: 'pro', name: 'Casemate Pro', price: DEFAULT_PLAN_PRICES.pro, features: [...PLAN_FEATURES.pro] },
     { id: 'annual', name: 'Annual Plan', price: DEFAULT_PLAN_PRICES.annual, features: [...PLAN_FEATURES.annual] }
   ]);
+  const [freeLimits, setFreeLimits] = useState<PlanLimits>(DEFAULT_FREE_PLAN_LIMITS);
 
   // API, Payment, Firebase & EmailJS Keys State
   const [keysConfig, setKeysConfig] = useState({
@@ -76,19 +93,72 @@ export const AdminDashboard = () => {
   ]);
 
   useEffect(() => {
-    loadUsers();
+    const tick = window.setInterval(() => setNowTick(Date.now()), 30000);
+    return () => window.clearInterval(tick);
+  }, []);
 
-    // Ensure Firebase Auth so cloud writes succeed (email/password admin account)
-    void ensureConfigWriteAuth().catch((e) => console.warn('Admin Firebase auth failed', e));
+  useEffect(() => {
+    let unsubDirectory = () => {};
+    let unsubSiteStats = () => {};
+    let cancelled = false;
+    try {
+      localStorage.removeItem('casemate_admin_creds');
+    } catch {
+      /* ignore */
+    }
 
-    // Load credentials
-    const creds = JSON.parse(localStorage.getItem('casemate_admin_creds') || '{"email":"admin@casemate.com","password":"admin123"}');
-    setAdminEmail(creds.email);
-    setAdminPassword(creds.password);
+    void (async () => {
+      const started = Date.now();
+      while (!auth.currentUser && Date.now() - started < 4000) {
+        await new Promise((r) => setTimeout(r, 150));
+        if (cancelled) return;
+      }
+      const ok = await verifyAdminSession();
+      if (!cancelled && !ok) void logout();
+    })();
+
+    void ensureConfigWriteAuth()
+      .then((ok) => {
+        if (cancelled) return;
+        if (!ok) {
+          setDirectoryError('Admin Firebase sign-in failed. Log out, then sign in again with the admin email and password that exist in Firebase Authentication.');
+          setSiteStatsError('Admin Firebase sign-in failed, so visit and login counts cannot load.');
+          setDirectoryReady(true);
+          return;
+        }
+        unsubSiteStats = subscribeSiteStats((next, error) => {
+          setSiteStats(next);
+          setSiteStatsError(error || '');
+        });
+        void getAppConfig<{ code14?: string; codeAlways?: string }>('promo_codes').then((data) => {
+          if (cancelled) return;
+          setPromo14(String(data?.code14 || ''));
+          setPromoAlways(String(data?.codeAlways || ''));
+        }).catch(() => {});
+        unsubDirectory = subscribeUserDirectory((users: DirectoryUser[], error) => {
+          setDirectoryReady(true);
+          if (error) {
+            setDirectoryError(error);
+            return;
+          }
+          setDirectoryError('');
+          setStats(users);
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setDirectoryError('Could not load live users.');
+        setDirectoryReady(true);
+      });
 
     // Load plans — prefer cloud so admin phone matches all users
     (async () => {
-      const cloudPlans = await getAppConfig<{ plans?: PlanConfig[] }>('plans');
+      const cloudPlans = await getAppConfig<{ plans?: PlanConfig[]; freeLimits?: PlanLimits }>('plans');
+      if (cloudPlans?.freeLimits) {
+        const cleanedFree = sanitizeFreePlanLimits(cloudPlans.freeLimits);
+        setFreeLimits(cleanedFree);
+        applyFreePlanConfig(cleanedFree);
+      }
       if (cloudPlans?.plans && Array.isArray(cloudPlans.plans) && cloudPlans.plans.length > 0) {
         const cleaned = sanitizeSubscriptionPlans(cloudPlans.plans);
         setPlans(cleaned);
@@ -133,53 +203,63 @@ export const AdminDashboard = () => {
     if (savedKeys) {
       try { setKeysConfig(JSON.parse(savedKeys)); } catch (e) { console.error(e); }
     }
-  }, []);
 
-  const loadUsers = () => {
-    const usersDb = JSON.parse(localStorage.getItem('casemate_users_db') || '[]');
-    const blockedUsers = JSON.parse(localStorage.getItem('casemate_blocked_users') || '[]');
-    
-    const userStats = usersDb.map((u: any) => {
-      const chats = JSON.parse(localStorage.getItem(`casemate_chats_${u.id}`) || '[]');
-      const usage = JSON.parse(localStorage.getItem(`casemate_usage_${u.id}`) || '3600');
-      
-      let docCount = 0;
-      chats.forEach((c: any) => {
-        c.messages.forEach((m: any) => {
-          if (m.isDocument) docCount++;
-        });
-      });
+    return () => {
+      cancelled = true;
+      unsubDirectory();
+      unsubSiteStats();
+    };
+  }, [logout]);
 
-      return {
-        id: u.id,
-        name: u.name,
-        email: u.email,
-        plan: u.plan || 'free',
-        totalChats: chats.length,
-        totalDocs: docCount,
-        timeLeft: usage,
-        isBlocked: blockedUsers.includes(u.id)
-      };
-    });
-    setStats(userStats);
+  const formatLastSeen = (ts: number) => {
+    if (!ts) return 'Not yet';
+    const diff = nowTick - ts;
+    if (diff < 2 * 60 * 1000) return 'Online now';
+    if (diff < 60 * 60 * 1000) return `${Math.max(1, Math.floor(diff / 60000))} min ago`;
+    if (diff < 24 * 60 * 60 * 1000) return `${Math.floor(diff / 3600000)} hr ago`;
+    return new Date(ts).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
   };
 
-  const toggleBlockUser = (userId: string) => {
-    let blockedUsers = JSON.parse(localStorage.getItem('casemate_blocked_users') || '[]');
-    if (blockedUsers.includes(userId)) {
-      blockedUsers = blockedUsers.filter((id: string) => id !== userId);
-    } else {
-      blockedUsers.push(userId);
-    }
-    localStorage.setItem('casemate_blocked_users', JSON.stringify(blockedUsers));
-    loadUsers();
-  };
-
-  const handleSaveCreds = (e: React.FormEvent) => {
+  const handleSaveCreds = async (e: React.FormEvent) => {
     e.preventDefault();
-    localStorage.setItem('casemate_admin_creds', JSON.stringify({ email: adminEmail, password: adminPassword }));
-    setShowSettings(false);
-    alert("Admin credentials updated successfully.");
+    setPasswordError('');
+    setPasswordMsg('');
+    if (!newPassword || newPassword.length < 6) {
+      setPasswordError(t.passwordTooShort || 'Password must be at least 6 characters.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError(t.passwordMismatch || 'New passwords do not match.');
+      return;
+    }
+    const firebaseUser = auth.currentUser;
+    if (!firebaseUser?.email) {
+      setPasswordError(t.passwordNeedLogin || 'Please sign out and sign in again, then try changing password.');
+      return;
+    }
+    setIsUpdatingPassword(true);
+    try {
+      const credential = EmailAuthProvider.credential(firebaseUser.email, currentPassword);
+      await reauthenticateWithCredential(firebaseUser, credential);
+      await updatePassword(firebaseUser, newPassword);
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      setPasswordMsg(t.passwordUpdated || 'Password updated successfully.');
+    } catch (err: any) {
+      const code = err?.code || '';
+      if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+        setPasswordError(t.wrongCurrentPassword || 'Current password is incorrect.');
+      } else if (code === 'auth/weak-password') {
+        setPasswordError(t.passwordTooShort || 'Password must be at least 6 characters.');
+      } else if (code === 'auth/requires-recent-login') {
+        setPasswordError(t.passwordNeedLogin || 'Please sign out and sign in again, then try changing password.');
+      } else {
+        setPasswordError('Could not update password.');
+      }
+    } finally {
+      setIsUpdatingPassword(false);
+    }
   };
 
   const handleSavePlans = async (e: React.FormEvent) => {
@@ -187,9 +267,12 @@ export const AdminDashboard = () => {
     setIsSavingCloud(true);
     try {
       const cleaned = sanitizeSubscriptionPlans(plans);
+      const cleanedFree = sanitizeFreePlanLimits(freeLimits);
       setPlans(cleaned);
+      setFreeLimits(cleanedFree);
+      applyFreePlanConfig(cleanedFree);
       localStorage.setItem('casemate_subscription_plans', JSON.stringify(cleaned));
-      const result = await saveAppConfigDetailed('plans', { plans: cleaned });
+      const result = await saveAppConfigDetailed('plans', { plans: cleaned, freeLimits: cleanedFree });
       setShowPlansModal(false);
       alert(result.ok ? 'Subscription plans updated on all devices.' : (result.error || 'Cloud save failed.'));
     } finally {
@@ -294,11 +377,34 @@ export const AdminDashboard = () => {
   };
 
   const totalUsers = stats.length;
-  const paidUsers = stats.filter(s => s.plan && s.plan !== 'free').length;
-  const freeUsers = totalUsers - paidUsers;
+  const usingNow = stats.filter((s) => nowTick - s.lastSeen < 5 * 60 * 1000).length;
+  const activeToday = stats.filter((s) => nowTick - s.lastSeen < 24 * 60 * 60 * 1000).length;
+  const activeWeek = stats.filter((s) => nowTick - s.lastSeen < 7 * 24 * 60 * 60 * 1000).length;
+  const istDay = new Date(nowTick).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  const joinedToday = stats.filter((s) => s.createdAt && new Date(s.createdAt).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }) === istDay).length;
+  const paidUsers = stats.filter((s) => s.plan && s.plan !== 'free' && s.plan !== 'unlimited').length;
+  const freeUsers = stats.filter((s) => !s.plan || s.plan === 'free').length;
+  const unlimitedUsers = stats.filter((s) => s.plan === 'unlimited' || isUnlimitedEmail(s.email)).length;
+  const seenEmails = new Set(stats.map((s) => s.email.trim().toLowerCase()));
+  const checkoutKey = String((import.meta as any).env?.VITE_RAZORPAY_KEY_ID || '');
+  const checkoutLive = checkoutKey.startsWith('rzp_live_');
+
+  const statCards = [
+    { label: 'Website visits', value: siteStats.visits, hint: 'One count per browser each day' },
+    { label: 'Successful logins', value: siteStats.logins, hint: 'Verified email sign-ins' },
+    { label: 'Accounts created', value: siteStats.signups, hint: 'New sign-ups' },
+    { label: t.totalUsers || 'Accounts', value: totalUsers, hint: 'Signed-in accounts on record' },
+    { label: 'Using now', value: usingNow, hint: 'Active in the last 5 minutes' },
+    { label: 'Active today', value: activeToday, hint: 'Opened the app today' },
+    { label: 'Active this week', value: activeWeek, hint: 'Opened the app in 7 days' },
+    { label: 'Joined today', value: joinedToday, hint: 'New accounts seen today' },
+    { label: 'Paid plans', value: paidUsers, hint: 'Basic, Pro, or Annual' },
+    { label: 'Free plans', value: freeUsers, hint: 'Still on the free plan' },
+    { label: 'Unlimited access', value: unlimitedUsers, hint: 'Tester emails with no limits' },
+  ];
 
   return (
-    <div className="min-h-screen bg-ink text-band-dim flex flex-col font-sans relative">
+    <div className="h-full min-h-0 overflow-y-auto custom-scrollbar bg-ink text-band-dim flex flex-col font-sans relative">
       {/* Header */}
       <header className="bg-ink-soft border-b border-ink-border px-6 py-4 flex flex-wrap items-center justify-between gap-4 shadow-sm">
         <div className="flex items-center gap-3">
@@ -355,42 +461,97 @@ export const AdminDashboard = () => {
       </header>
 
       <main className="flex-1 p-6 max-w-7xl mx-auto w-full space-y-6">
-        {/* Stats Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="bg-ink-soft border border-ink-border rounded-2xl p-6 flex items-center gap-4 shadow-sm">
-            <div className="w-12 h-12 bg-white/5 rounded-full flex items-center justify-center border border-ink-border">
-              <UsersIcon className="w-6 h-6 text-band-dim" />
+        <div className={`rounded-xl border px-4 py-3 text-sm ${checkoutLive ? 'border-green-500/40 bg-green-950/40 text-green-100' : 'border-amber-500/50 bg-amber-950/50 text-amber-100'}`}>
+          {checkoutLive
+            ? 'Razorpay checkout on this website is Live. In the Razorpay dashboard, switch the top toggle from Test to Live. Real payments stay hidden while Test is selected.'
+            : 'Razorpay checkout on this website is still Test. Put your rzp_live_ key in frontend/.env as VITE_RAZORPAY_KEY_ID and the matching secret on the API server, then deploy again.'}
+        </div>
+
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {statCards.map((card) => (
+            <div key={card.label} className="bg-ink-soft border border-ink-border rounded-2xl p-5 shadow-sm">
+              <p className="text-xs text-band-mute font-medium">{card.label}</p>
+              <p className="text-3xl font-bold text-white mt-1">{card.value}</p>
+              <p className="text-[11px] text-band-mute mt-1">{card.hint}</p>
             </div>
-            <div>
-              <p className="text-sm text-band-mute font-medium">{t.totalUsers}</p>
-              <p className="text-3xl font-bold text-white">{totalUsers}</p>
-            </div>
+          ))}
+        </div>
+
+        {siteStatsError && (
+          <div className="rounded-xl border border-red-500/40 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+            Visit and login counts failed: {siteStatsError}
           </div>
-          <div className="bg-ink-soft border border-ink-border rounded-2xl p-6 flex items-center gap-4 shadow-sm">
-            <div className="w-12 h-12 bg-yellow-900/30 rounded-full flex items-center justify-center border border-yellow-800/50">
-              <ActivityIcon className="w-6 h-6 text-yellow-400" />
-            </div>
-            <div>
-              <p className="text-sm text-band-mute font-medium">Paid Users</p>
-              <p className="text-3xl font-bold text-white">{paidUsers}</p>
-            </div>
+        )}
+
+        <p className="text-xs text-band-mute -mt-2">
+          Visits, logins, and sign-ups start from the next time someone opens the site. “Using now” means the app was open in the last 5 minutes.
+        </p>
+
+        {directoryError && (
+          <div className="rounded-xl border border-red-500/40 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+            Live user list failed: {directoryError}
           </div>
-          <div className="bg-ink-soft border border-ink-border rounded-2xl p-6 flex items-center gap-4 shadow-sm">
-            <div className="w-12 h-12 bg-ink-muted rounded-full flex items-center justify-center border border-ink-border">
-              <UsersIcon className="w-6 h-6 text-band-mute" />
-            </div>
-            <div>
-              <p className="text-sm text-band-mute font-medium">{t.freeUsers}</p>
-              <p className="text-3xl font-bold text-white">{freeUsers}</p>
-            </div>
+        )}
+
+        <div className="bg-ink-soft border border-ink-border rounded-2xl shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-ink-border bg-ink-muted/40">
+            <h2 className="text-lg font-semibold text-white">Unlimited tester access</h2>
+            <p className="text-xs text-band-mute mt-1">These emails skip draft, timer, and fair-use limits once they sign up with this address.</p>
           </div>
+          <ul className="divide-y divide-ink-border/80">
+            {UNLIMITED_EMAIL_LIST.map((email) => {
+              const joined = seenEmails.has(email);
+              return (
+                <li key={email} className="px-6 py-3 flex items-center justify-between gap-3 text-sm">
+                  <span className="text-white truncate">{email}</span>
+                  <span className={`text-xs font-medium px-2.5 py-1 rounded-full border ${joined ? 'text-green-300 border-green-500/40 bg-green-950/40' : 'text-band-mute border-ink-border bg-ink-muted'}`}>
+                    {joined ? 'Has opened the app' : 'Not signed in yet'}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+
+        <div className="bg-ink-soft border border-ink-border rounded-2xl shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-ink-border bg-ink-muted/40">
+            <h2 className="text-lg font-semibold text-white">Promo codes</h2>
+            <p className="text-xs text-band-mute mt-1">These do not change the unlimited email list above. The 14-day code lasts 14 days from the time it is entered. Changing the always code turns off unlimited for people who used the previous always code. People already inside their 14 days keep those days.</p>
+          </div>
+          <form
+            className="px-6 py-4 space-y-3"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              setPromoSaving(true);
+              setPromoNote('');
+              const saved = await saveAppConfigDetailed('promo_codes', {
+                code14: promo14.trim().toUpperCase().replace(/\s+/g, ''),
+                codeAlways: promoAlways.trim().toUpperCase().replace(/\s+/g, ''),
+              });
+              setPromoSaving(false);
+              setPromoNote(saved.ok ? 'Promo codes saved.' : (saved.error || 'Could not save promo codes.'));
+            }}
+          >
+            <label className="block text-sm text-band-mute">
+              14-day unlimited
+              <input value={promo14} onChange={(e) => setPromo14(e.target.value)} className="mt-1 w-full rounded-xl border border-ink-border bg-ink px-4 py-3 text-white outline-none" />
+            </label>
+            <label className="block text-sm text-band-mute">
+              Always unlimited
+              <input value={promoAlways} onChange={(e) => setPromoAlways(e.target.value)} className="mt-1 w-full rounded-xl border border-ink-border bg-ink px-4 py-3 text-white outline-none" />
+            </label>
+            <button type="submit" disabled={promoSaving || !promo14.trim() || !promoAlways.trim()} className="rounded-xl bg-white text-black px-4 py-2 text-sm font-semibold disabled:opacity-60">
+              {promoSaving ? 'Saving…' : 'Save promo codes'}
+            </button>
+            {promoNote && <p className="text-sm text-band-mute">{promoNote}</p>}
+          </form>
         </div>
 
         {/* Users Table & Management */}
         <div className="bg-ink-soft border border-ink-border rounded-2xl shadow-sm overflow-hidden">
           <div className="px-6 py-4 border-b border-ink-border bg-ink-muted/40 flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-white">Registered Users & Control</h2>
-            <span className="text-xs text-band-mute">Manage user status & access</span>
+            <h2 className="text-lg font-semibold text-white">Who is using casemate</h2>
+            <span className="text-xs text-band-mute">{directoryReady ? 'Live from every device' : 'Loading…'}</span>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
@@ -399,46 +560,43 @@ export const AdminDashboard = () => {
                   <th className="px-6 py-4 font-medium">{t.userName}</th>
                   <th className="px-6 py-4 font-medium">{t.email}</th>
                   <th className="px-6 py-4 font-medium">{t.plan}</th>
-                  <th className="px-6 py-4 font-medium">Activity</th>
-                  <th className="px-6 py-4 font-medium">Status Control</th>
+                  <th className="px-6 py-4 font-medium">Last active</th>
+                  <th className="px-6 py-4 font-medium">Status</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-ink-border/80">
                 {stats.length === 0 ? (
                   <tr>
                     <td colSpan={5} className="px-6 py-8 text-center text-band-mute italic">
-                      No users registered yet.
+                      {directoryReady ? 'No one has opened the app since live tracking started.' : 'Loading users…'}
                     </td>
                   </tr>
                 ) : (
-                  stats.map((user) => (
+                  stats.map((user) => {
+                    const online = nowTick - user.lastSeen < 5 * 60 * 1000;
+                    const unlimited = user.plan === 'unlimited' || isUnlimitedEmail(user.email);
+                    return (
                     <tr key={user.id} className="hover:bg-ink-muted/40 transition-colors">
                       <td className="px-6 py-4 font-medium text-white">{user.name}</td>
                       <td className="px-6 py-4 text-band-mute">{user.email}</td>
                       <td className="px-6 py-4">
                         <span className={`px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wide ${
-                          user.plan !== 'free' ? 'bg-yellow-900/30 text-yellow-400 border border-yellow-800/50' : 'bg-ink-muted text-band-dim border border-ink-border'
+                          unlimited || user.plan !== 'free' ? 'bg-yellow-900/30 text-yellow-400 border border-yellow-800/50' : 'bg-ink-muted text-band-dim border border-ink-border'
                         }`}>
-                          {user.plan}
+                          {unlimited ? 'unlimited' : user.plan}
                         </span>
                       </td>
                       <td className="px-6 py-4 text-band-mute text-xs">
-                        Chats: {user.totalChats} | Docs: {user.totalDocs}
+                        {formatLastSeen(user.lastSeen)}
                       </td>
                       <td className="px-6 py-4">
-                        <button
-                          onClick={() => toggleBlockUser(user.id)}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                            user.isBlocked 
-                              ? 'bg-green-600/20 text-green-400 border border-green-500/30 hover:bg-green-600/30' 
-                              : 'bg-red-600/20 text-red-400 border border-red-500/30 hover:bg-red-600/30'
-                          }`}
-                        >
-                          {user.isBlocked ? 'Unblock User' : 'Block User'}
-                        </button>
+                        <span className={`text-xs font-medium ${online ? 'text-green-400' : 'text-band-mute'}`}>
+                          {online ? 'Using now' : 'Away'}
+                        </span>
                       </td>
                     </tr>
-                  ))
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -468,6 +626,36 @@ export const AdminDashboard = () => {
             </div>
             
             <form onSubmit={handleSavePlans} className="space-y-4">
+              <div className="bg-ink-muted/70 p-4 rounded-2xl border border-ink-border space-y-3">
+                <p className="text-xs font-bold uppercase tracking-wider text-band-dim">Free plan limits</p>
+                <p className="text-xs text-band-mute">These apply to every free account. Changing them updates the website and the app. Do not cut an allowance without checking cost.</p>
+                <div className="grid grid-cols-2 gap-3">
+                  {([
+                    ['draftLimit', 'Drafts / month'],
+                    ['dailyAiRequests', 'AI requests / day'],
+                    ['dailySeconds', 'Daily seconds (0 = off)'],
+                    ['maxPhotosPerChat', 'Photos / chat'],
+                    ['maxPhotosPerUpload', 'Photos / upload'],
+                    ['maxMessageChars', 'Chars / message'],
+                    ['maxSessionChars', 'Chars / chat'],
+                    ['monthlyAiRequests', 'AI requests / month'],
+                    ['monthlyImages', 'Images / month'],
+                    ['chatSessionLimit', 'Saved chats'],
+                    ['maxDevices', 'Devices'],
+                  ] as Array<[keyof PlanLimits, string]>).map(([key, label]) => (
+                    <label key={key} className="block text-xs font-medium text-band-mute">
+                      {label}
+                      <input
+                        type="number"
+                        min={0}
+                        className="mt-1 w-full px-3 py-2 rounded-xl bg-ink-muted border border-ink-border text-white text-sm outline-none"
+                        value={Number.isFinite(freeLimits[key] as number) ? Number(freeLimits[key]) : 0}
+                        onChange={(e) => setFreeLimits((prev) => ({ ...prev, [key]: Number(e.target.value) }))}
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
               {plans.map((p, index) => (
                 <div key={p.id || index} className="bg-ink-muted/70 p-4 rounded-2xl border border-ink-border space-y-3 relative">
                   <div className="flex items-center justify-between">
@@ -545,7 +733,7 @@ export const AdminDashboard = () => {
       {/* 2. API, Razorpay, Firebase & EmailJS Keys Modal */}
       {showKeysModal && (
         <div className="fixed inset-0 bg-ink/85 flex items-center justify-center z-[100] backdrop-blur-sm p-4">
-          <div className="bg-ink-soft p-8 rounded-3xl max-w-lg w-full shadow-2xl relative border border-ink-border max-h-[90vh] overflow-y-auto">
+          <div className="bg-ink-soft p-8 rounded-3xl max-w-lg w-full shadow-2xl relative border border-ink-border max-h-[90vh] overflow-y-auto custom-scrollbar">
             <button onClick={() => setShowKeysModal(false)} className="absolute top-4 right-4 text-band-mute hover:text-white">
               <XIcon className="w-6 h-6" />
             </button>
@@ -839,24 +1027,52 @@ export const AdminDashboard = () => {
                 <label className="block text-sm font-medium text-band-mute mb-1">{t.newAdminEmail}</label>
                 <input
                   type="email"
-                  required
-                  className="w-full px-4 py-3 rounded-xl bg-ink-muted border border-ink-border text-white outline-none"
-                  value={adminEmail}
-                  onChange={(e) => setAdminEmail(e.target.value)}
+                  readOnly
+                  className="w-full px-4 py-3 rounded-xl bg-ink-muted border border-ink-border text-band-mute outline-none"
+                  value={ADMIN_EMAIL}
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-band-mute mb-1">{t.newAdminPassword}</label>
+                <label className="block text-sm font-medium text-band-mute mb-1">{t.currentPassword}</label>
                 <input
-                  type="text"
+                  type="password"
+                  autoComplete="current-password"
                   required
                   className="w-full px-4 py-3 rounded-xl bg-ink-muted border border-ink-border text-white outline-none"
-                  value={adminPassword}
-                  onChange={(e) => setAdminPassword(e.target.value)}
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
                 />
               </div>
-              <button type="submit" className="mt-6 w-full bg-white text-black hover:bg-neutral-200 py-3 rounded-xl font-medium transition-colors">
-                {t.updateCreds}
+              <div>
+                <label className="block text-sm font-medium text-band-mute mb-1">{t.newPassword}</label>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  className="w-full px-4 py-3 rounded-xl bg-ink-muted border border-ink-border text-white outline-none"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-band-mute mb-1">{t.confirmNewPassword}</label>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  className="w-full px-4 py-3 rounded-xl bg-ink-muted border border-ink-border text-white outline-none"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                />
+              </div>
+              {passwordError && <p className="text-xs text-red-400">{passwordError}</p>}
+              {passwordMsg && <p className="text-xs text-green-400">{passwordMsg}</p>}
+              <button
+                type="submit"
+                disabled={isUpdatingPassword}
+                className="mt-6 w-full bg-white text-black hover:bg-neutral-200 py-3 rounded-xl font-medium transition-colors disabled:opacity-60"
+              >
+                {t.updatePassword || t.updateCreds}
               </button>
             </form>
           </div>

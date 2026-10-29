@@ -1,5 +1,5 @@
 import emailjs from '@emailjs/browser';
-import { doc, setDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { getAppConfig } from './adminConfigService';
 import { db } from './firebaseService';
 
@@ -14,11 +14,7 @@ type EmailKeys = {
 const envKeys = (): EmailKeys => ({
   serviceId: String((import.meta as any).env?.VITE_EMAILJS_SERVICE_ID || ''),
   publicKey: String((import.meta as any).env?.VITE_EMAILJS_PUBLIC_KEY || ''),
-  welcomeTemplateId: String(
-    (import.meta as any).env?.VITE_EMAILJS_WELCOME_TEMPLATE_ID ||
-      (import.meta as any).env?.VITE_EMAILJS_TEMPLATE_ID ||
-      ''
-  ),
+  welcomeTemplateId: String((import.meta as any).env?.VITE_EMAILJS_WELCOME_TEMPLATE_ID || ''),
   purchaseTemplateId: String(
     (import.meta as any).env?.VITE_EMAILJS_PURCHASE_TEMPLATE_ID ||
       (import.meta as any).env?.VITE_EMAILJS_TEMPLATE_ID ||
@@ -57,11 +53,17 @@ const resolveKeys = async (): Promise<EmailKeys> => {
   return {
     serviceId: cachedCloudKeys?.serviceId || base.serviceId,
     publicKey: cachedCloudKeys?.publicKey || base.publicKey,
-    welcomeTemplateId: cachedCloudKeys?.welcomeTemplateId || base.welcomeTemplateId,
+    welcomeTemplateId:
+      (cachedCloudKeys?.welcomeTemplateId && cachedCloudKeys.welcomeTemplateId !== otpTemplateId()
+        ? cachedCloudKeys.welcomeTemplateId
+        : '') || base.welcomeTemplateId,
     purchaseTemplateId: cachedCloudKeys?.purchaseTemplateId || base.purchaseTemplateId,
     expiryTemplateId: cachedCloudKeys?.expiryTemplateId || base.expiryTemplateId,
   };
 };
+
+const APP_URL = 'https://meetcasemate.com';
+const FROM_EMAIL = 'meetcasemate@gmail.com';
 
 const sendCasemateEmail = async (opts: {
   templateId: string;
@@ -78,17 +80,24 @@ const sendCasemateEmail = async (opts: {
   }
   if (!opts.toEmail) return false;
 
+  const toName = opts.toName || 'Advocate';
   await emailjs.send(
     keys.serviceId,
     opts.templateId,
     {
+      // The EmailJS template's To field is {{email}}. to_email alone leaves it empty.
+      email: opts.toEmail,
       to_email: opts.toEmail,
-      to_name: opts.toName || 'Advocate',
+      user_email: opts.toEmail,
+      name: toName,
+      to_name: toName,
       from_name: 'casemate',
+      from_email: FROM_EMAIL,
+      reply_to: FROM_EMAIL,
       subject: opts.subject,
       message: opts.message,
       app_name: 'casemate',
-      app_url: 'https://legalai-78759.web.app',
+      app_url: APP_URL,
       ...(opts.extra || {}),
     },
     keys.publicKey
@@ -96,20 +105,64 @@ const sendCasemateEmail = async (opts: {
   return true;
 };
 
-/** 1. Welcome email after signup */
+const apiBase = () =>
+  String((import.meta as any).env?.VITE_API_BASE_URL || '').replace(/\/$/, '');
+
+const verificationEndpoints = (): string[] => {
+  const urls: string[] = [];
+  const base = apiBase();
+  if (base) urls.push(`${base}/api/verification-link`);
+  urls.push('https://asia-south1-legalai-78759.cloudfunctions.net/verificationLink');
+  return urls;
+};
+
+/** Real Firebase verify link for this signed-in account. */
+export const fetchVerificationLink = async (idToken: string): Promise<string> => {
+  if (!idToken) return '';
+  for (const url of verificationEndpoints()) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!res.ok) continue;
+      const data = await res.json().catch(() => null);
+      if (typeof data?.link === 'string' && data.link.startsWith('https://')) return data.link;
+    } catch {
+      /* try the next endpoint */
+    }
+  }
+  return '';
+};
+
+const otpTemplateId = () => String((import.meta as any).env?.VITE_EMAILJS_TEMPLATE_ID || '');
+
+/** The welcome template must be a different EmailJS template from the OTP mail. */
+const distinctWelcomeTemplateId = (candidate?: string) => {
+  const id = String(candidate || '').trim();
+  if (!id || id === otpTemplateId()) return '';
+  return id;
+};
+
+/** Welcome email. Uses the second EmailJS template, never the OTP template. */
 export const sendWelcomeEmail = async (userEmail: string, userName: string): Promise<boolean> => {
   try {
     const keys = await resolveKeys();
+    const templateId = distinctWelcomeTemplateId(keys.welcomeTemplateId);
+    if (!templateId) {
+      console.error('[Email] Welcome template is not set.');
+      return false;
+    }
     const ok = await sendCasemateEmail({
-      templateId: keys.welcomeTemplateId,
+      templateId,
       toEmail: userEmail,
       toName: userName,
       subject: 'Welcome to casemate',
       message:
         `Dear ${userName || 'Advocate'},\n\n` +
         `Welcome to casemate — your AI legal drafting assistant.\n\n` +
-        `Your account has been created successfully. Please verify your email if you haven't already, then sign in to start drafting.\n\n` +
-        `Website: https://legalai-78759.web.app\n\n` +
+        `Your account is ready.\n\n` +
+        `Website: ${APP_URL}\n\n` +
         `Regards,\nTeam casemate`,
     });
     if (ok) console.log('[Email] Welcome email sent to', userEmail);
@@ -117,6 +170,21 @@ export const sendWelcomeEmail = async (userEmail: string, userName: string): Pro
   } catch (error) {
     console.error('[Email] Welcome failed:', error);
     return false;
+  }
+};
+
+/** Sends the welcome template once per account, after a successful sign-in. */
+export const sendWelcomeEmailOnce = async (uid: string, userEmail: string, userName: string): Promise<void> => {
+  if (!uid || !userEmail || !userEmail.includes('@')) return;
+  try {
+    const ref = doc(db, 'users_data', uid);
+    const snap = await getDoc(ref);
+    if (snap.exists() && snap.get('welcomeEmailSent') === true) return;
+    const ok = await sendWelcomeEmail(userEmail, userName);
+    if (!ok) return;
+    await setDoc(ref, { welcomeEmailSent: true, updatedAt: Date.now() }, { merge: true });
+  } catch (error) {
+    console.error('[Email] Welcome once failed:', error);
   }
 };
 
@@ -179,7 +247,7 @@ export const sendExpiryAlertEmail = async (
         `Dear ${userName || 'Advocate'},\n\n` +
         `This is a reminder that ${planLabel} will expire in ${daysLeft} day${daysLeft === 1 ? '' : 's'}.\n\n` +
         `Please renew your plan to continue uninterrupted access to drafting and advanced features.\n\n` +
-        `Renew here: https://legalai-78759.web.app\n\n` +
+        `Renew here: ${APP_URL}\n\n` +
         `Regards,\nTeam casemate`,
       extra: {
         days_left: String(daysLeft),

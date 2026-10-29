@@ -53,7 +53,7 @@ const getFirebaseConfig = () => {
 
   return {
     apiKey: "AIzaSyCvx7vSFA0bY__cz8KSuHVwv9tui6IuIz0",
-    authDomain: "legalai-78759.firebaseapp.com",
+    authDomain: "meetcasemate.com",
     projectId: "legalai-78759",
     storageBucket: "legalai-78759.firebasestorage.app",
     messagingSenderId: "556075485433",
@@ -84,6 +84,36 @@ const firestoreDatabaseId =
 
 export const db = getFirestore(app, firestoreDatabaseId);
 export const storage = getStorage(app);
+
+let appCheckInstance: { getToken?: unknown } | null = null;
+const initAppCheck = async () => {
+  const siteKey = String(import.meta.env.VITE_FIREBASE_APPCHECK_SITE_KEY || '').trim();
+  if (!siteKey || appCheckInstance || typeof window === 'undefined') return;
+  try {
+    const { initializeAppCheck, ReCaptchaV3Provider } = await import('firebase/app-check');
+    appCheckInstance = initializeAppCheck(app, {
+      provider: new ReCaptchaV3Provider(siteKey),
+      isTokenAutoRefreshEnabled: true,
+    });
+  } catch {
+    appCheckInstance = null;
+  }
+};
+void initAppCheck();
+
+export const isAppCheckConfigured = (): boolean =>
+  Boolean(String(import.meta.env.VITE_FIREBASE_APPCHECK_SITE_KEY || '').trim());
+
+export const getAppCheckHeader = async (): Promise<Record<string, string>> => {
+  if (!appCheckInstance) return {};
+  try {
+    const { getToken } = await import('firebase/app-check');
+    const token = await getToken(appCheckInstance as Parameters<typeof getToken>[0], false);
+    return token?.token ? { 'X-Firebase-AppCheck': token.token } : {};
+  } catch {
+    return {};
+  }
+};
 
 export const sendPasswordReset = async (email: string) => {
   const trimmed = email.trim();

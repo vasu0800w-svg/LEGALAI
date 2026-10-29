@@ -11,10 +11,17 @@
     "build:web": "npm run build --prefix frontend",
     "build:android": "npm run build:android --prefix frontend",
     "open:android": "npm run open:android --prefix frontend",
-    "deploy:hosting": "npm run build:web && npx firebase-tools deploy --only hosting"
+    "deploy:hosting": "npm run build:web && npx firebase-tools deploy --only hosting",
+    "test:backend": "npm test --prefix backend",
+    "test:frontend": "node --experimental-strip-types --test frontend/utils/templateFill.test.ts frontend/utils/scanTemplate.test.ts frontend/utils/adminIdentity.test.ts",
+    "test:rules": "npx firebase-tools emulators:exec --only firestore,storage --project demo-casemate-rules \"node --test rules-tests/rules.test.js\""
   },
   "devDependencies": {
-    "concurrently": "latest",
+    "@firebase/rules-unit-testing": "^6.0.0",
+    "concurrently": "10.0.6",
     "firebase-tools": "^14.27.0"
+  },
+  "overrides": {
+    "proxy-addr": "2.0.8"
   }
 }

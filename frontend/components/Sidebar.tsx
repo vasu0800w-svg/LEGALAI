@@ -3,7 +3,9 @@ import { useAppContext } from '../context/AppContext';
 import { PlusIcon, SettingsIcon, LogoutIcon, SparklesIcon, SearchIcon, TrashIcon, EditIcon, CheckIcon, XIcon } from './Icons';
 import { BrandLogo } from './BrandLogo';
 import { translations } from '../utils/translations';
-import { isUnlimitedEmail, DEFAULT_PLAN_PRICES } from '../utils/planLimits';
+import { hasUnlimitedAccess, DEFAULT_PLAN_PRICES } from '../utils/planLimits';
+import { FreeUsageStrip } from './UsageMeter';
+import { chatStartedAt, formatChatDay } from '../utils/chatLabel';
 import { sendPasswordReset } from '../services/firebaseService';
 
 const formatTime = (seconds: number) => {
@@ -34,11 +36,10 @@ export const Sidebar = () => {
     renameChatSession,
     setIsSettingsOpen,
     setIsSubscriptionModalOpen,
-    setIsUpgradeModalOpen,
     isSidebarOpen,
     setIsSidebarOpen,
-    isTimeUp,
     language,
+    userMode,
     logout,
     subscriptionPlans,
   } = useAppContext();
@@ -60,10 +61,13 @@ export const Sidebar = () => {
   const hideFooterWhileSearching = isSearchFocused || searchQuery.trim().length > 0;
 
   const filteredSessions = useMemo(() => {
+    const mine = chatSessions.filter((session) => (session.userMode === 'judge' ? 'judge' : 'advocate') === userMode);
     const q = searchQuery.toLowerCase();
-    if (!q) return chatSessions;
-    return chatSessions.filter((session) => session.title.toLowerCase().includes(q));
-  }, [chatSessions, searchQuery]);
+    if (!q) return mine;
+    return mine.filter((session) =>
+      session.title.toLowerCase().includes(q) || (session.caseDate || '').toLowerCase().includes(q)
+    );
+  }, [chatSessions, searchQuery, userMode]);
 
   const closeSidebar = () => setIsSidebarOpen(false);
 
@@ -87,10 +91,6 @@ export const Sidebar = () => {
   };
 
   const handleNewChat = () => {
-    if (isTimeUp && !isUnlimitedEmail(user?.email)) {
-      setIsUpgradeModalOpen(true);
-      return;
-    }
     createNewSession();
     closeSidebar();
   };
@@ -128,8 +128,7 @@ export const Sidebar = () => {
         <div className="p-4 pb-2 flex-shrink-0">
           <button 
             onClick={handleNewChat}
-            disabled={isTimeUp && !isUnlimitedEmail(user?.email)}
-            className="w-full flex items-center gap-2 bg-ink-muted hover:bg-neutral-800 text-white py-2.5 px-4 rounded-lg transition-colors font-medium text-sm border border-ink-border disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-ink-muted"
+            className="w-full flex items-center gap-2 bg-ink-muted hover:bg-neutral-800 text-white py-2.5 px-4 rounded-lg transition-colors font-medium text-sm border border-ink-border"
           >
             <PlusIcon className="w-4 h-4" />
             {t.newChat}
@@ -168,7 +167,7 @@ export const Sidebar = () => {
           <div className="text-xs font-semibold text-band-mute mb-2 px-2 uppercase tracking-wider mt-1">{t.recentCases}</div>
           {filteredSessions.length === 0 ? (
             <div className="text-sm text-band-mute px-2 italic">
-              {chatSessions.length === 0 ? t.noRecentCases : "No matching chats found"}
+              {filteredSessions.length === 0 ? t.noRecentCases : "No matching chats found"}
             </div>
           ) : (
             filteredSessions.map(session => (
@@ -215,17 +214,20 @@ export const Sidebar = () => {
                   </div>
                 ) : (
                   <>
-                    <span className="truncate flex-1 pr-2 text-left text-base font-semibold">{session.title}</span>
+                    <span className="min-w-0 flex-1 pr-2 text-left">
+                      <span className="block truncate text-base font-semibold">
+                        {session.title}
+                        {session.messages.some((m) => m.isDocument) ? (
+                          <span className="ml-1 text-[10px] font-medium text-amber-400 uppercase">Draft</span>
+                        ) : null}
+                      </span>
+                      <span className="block truncate text-[11px] font-medium text-band-mute">
+                        {session.caseDate || formatChatDay(chatStartedAt(session), language)}
+                      </span>
+                    </span>
                     <div className="flex items-center gap-0.5 flex-shrink-0 opacity-100">
                       <button 
-                        onClick={(e) => {
-                          if (isTimeUp && !isUnlimitedEmail(user?.email)) {
-                            e.stopPropagation();
-                            setIsUpgradeModalOpen(true);
-                            return;
-                          }
-                          handleStartRename(e, session);
-                        }}
+                        onClick={(e) => handleStartRename(e, session)}
                         className="text-band-mute hover:text-white p-1.5 rounded transition-colors"
                         title="Rename Chat"
                         aria-label="Rename chat"
@@ -251,11 +253,12 @@ export const Sidebar = () => {
         {!hideFooterWhileSearching && (
         <div className="p-4 border-t border-ink-border space-y-3 bg-ink-soft/80 flex-shrink-0 app-safe-bottom">
           <div className="flex items-center justify-between px-2 py-1 text-sm bg-ink-muted/70 rounded-lg border border-ink-border/50">
-            <span className="text-band-mute">{t.plan}: <span className={`font-medium capitalize ${user?.plan && user?.plan !== 'free' ? 'text-yellow-400' : 'text-white'}`}>{user?.plan || 'free'}</span></span>
-            {(!user?.plan || user?.plan === 'free') && (
+            <span className="text-band-mute">{t.plan}: <span className={`font-medium capitalize ${hasUnlimitedAccess(user?.email, user) || (user?.plan && user?.plan !== 'free') ? 'text-yellow-400' : 'text-white'}`}>{hasUnlimitedAccess(user?.email, user) ? 'Unlimited' : (user?.plan || 'free')}</span></span>
+            {!hasUnlimitedAccess(user?.email, user) && (!user?.plan || user?.plan === 'free') && (
               <UsageTimeBadge label={t.left} />
             )}
           </div>
+          <FreeUsageStrip compact />
           
           <button 
             onClick={() => { setIsSettingsOpen(true); closeSidebar(); }} 
@@ -271,7 +274,7 @@ export const Sidebar = () => {
           >
             <div className="flex items-center gap-2 text-sm font-semibold">
               <SparklesIcon className="w-4 h-4" />
-              <span>Upgrade Plan</span>
+              <span>{hasUnlimitedAccess(user?.email, user) || (user?.plan && user.plan !== 'free') ? 'Manage plan' : 'Upgrade Plan'}</span>
             </div>
             <div className="text-[10px] text-band-mute text-left pl-6 truncate">
               {plans.map(p => `${p.name} ₹${p.price}`).join(' • ')}

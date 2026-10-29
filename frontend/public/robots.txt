@@ -1,0 +1,10 @@
+User-agent: *
+Allow: /
+Allow: /privacy
+Allow: /terms
+Allow: /refund
+Allow: /about
+
+# Chat, settings, and account screens are not public URLs. They only appear after sign-in on /.
+
+Sitemap: https://meetcasemate.com/sitemap.xml

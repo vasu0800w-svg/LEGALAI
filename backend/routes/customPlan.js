@@ -10,15 +10,12 @@ import {
   quoteCustomPlan,
   publicQuote,
 } from '../lib/customPlan.js';
+import { applyCors } from '../lib/httpSecurity.js';
 
-const cors = (res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-};
+const cors = (req, res) => applyCors(req, res, 'GET, POST, OPTIONS');
 
-export function customPlanOptionsHandler(_req, res) {
-  cors(res);
+export function customPlanOptionsHandler(req, res) {
+  cors(req, res);
   res.status(204).end();
 }
 
@@ -34,8 +31,8 @@ export async function loadCustomPricing() {
   }
 }
 
-export async function customPlanCatalogHandler(_req, res) {
-  cors(res);
+export async function customPlanCatalogHandler(req, res) {
+  cors(req, res);
   try {
     const pricing = await loadCustomPricing();
     const selection = defaultCustomSelection(pricing);
@@ -64,7 +61,7 @@ export async function customPlanCatalogHandler(_req, res) {
 }
 
 export async function customPlanQuoteHandler(req, res) {
-  cors(res);
+  cors(req, res);
   try {
     const pricing = await loadCustomPricing();
     const quote = quoteCustomPlan(req.body?.selection || req.body, pricing);

@@ -12,7 +12,7 @@ export const userManual: Record<string, { heading: string; intro: string; sectio
         title: '1. Getting started',
         paragraphs: [
           'Create an account with your name, email, and password, then sign in. Use Forgot password if you cannot sign in.',
-          'Open Settings to switch the app language between English and Hindi. AI replies and drafts follow this language.',
+          'Open Settings to choose the app language. AI replies and drafts follow that language, including the regional languages used in Indian courts.',
           'Your chats are saved to the cloud on your account so you can continue on another phone or the website.',
         ],
       },
@@ -55,10 +55,11 @@ export const userManual: Record<string, { heading: string; intro: string; sectio
       {
         title: '6. Plans and limits',
         paragraphs: [
-          'Free: 1 hour per day and 5 drafts per month, with character limits per message and chat.',
-          'Basic ₹2,999/month: unlimited drafts and unlimited case photo uploads, subject to fair use, on up to 3 devices.',
-          'Pro ₹4,999/month and Annual ₹29,999: unlimited drafts with a higher fair-use allowance, larger chat limits, and up to 5 devices.',
-          'Pay with Razorpay. When a free limit is reached you can still read old chats; new chats and edits unlock after upgrade.',
+          'Free: 1 hour per day and 5 drafts per month, with character and photo limits per chat.',
+          'Casemate Basic ₹2,999/month: 50 completed drafts, 80 photos per upload, 60,000 characters per chat, up to 3 devices.',
+          'Casemate Pro ₹4,999/month: unlimited drafts under monthly AI fair use, about 200 photos per upload, larger chats, up to 5 devices.',
+          'Annual ₹34,990/year is the same as Pro. Twelve months of Pro is ₹59,988, so the annual saving is ₹24,998 (about 41.7%) before tax.',
+          'Pay with Razorpay. Access lasts until the date stored on the account. There is no automatic renewal in the app.',
         ],
       },
       {
@@ -79,7 +80,7 @@ export const userManual: Record<string, { heading: string; intro: string; sectio
         title: '1. शुरुआत',
         paragraphs: [
           'नाम, ईमेल और पासवर्ड से खाता बनाएँ, फिर साइन इन करें। साइन इन न हो तो पासवर्ड भूल गए का उपयोग करें।',
-          'सेटिंग्स में ऐप की भाषा अंग्रेज़ी या हिंदी चुनें। एआई के उत्तर और ड्राफ्ट इसी भाषा में आते हैं।',
+          'सेटिंग्स में ऐप की भाषा चुनें। एआई के उत्तर और ड्राफ्ट उसी भाषा में आते हैं, जिनमें भारत के क्षेत्रीय भाषाएँ भी शामिल हैं।',
           'चैट आपके खाते पर क्लाउड में सहेजी जाती हैं, ताकि दूसरी फ़ोन या वेबसाइट पर काम जारी रह सके।',
         ],
       },
@@ -122,10 +123,11 @@ export const userManual: Record<string, { heading: string; intro: string; sectio
       {
         title: '6. योजनाएँ और सीमाएँ',
         paragraphs: [
-          'मुफ़्त: प्रतिदिन 1 घंटा और महीने में 5 ड्राफ्ट, संदेश और चैट की वर्ण सीमा के साथ।',
-          'बेसिक ₹2,999/माह: असीमित ड्राफ्ट और असीमित केस फ़ोटो अपलोड (उचित उपयोग के अधीन), अधिकतम 3 डिवाइस पर।',
-          'प्रो ₹4,999/माह और वार्षिक ₹29,999: असीमित ड्राफ्ट, अधिक उचित-उपयोग सीमा, बड़ी चैट सीमा और अधिकतम 5 डिवाइस।',
-          'भुगतान Razorpay से। मुफ़्त सीमा खत्म होने पर पुरानी चैट पढ़ सकते हैं; नई चैट और संपादन अपग्रेड के बाद खुलते हैं।',
+          'मुफ़्त: प्रतिदिन 1 घंटा और महीने में 5 ड्राफ्ट, चैट की वर्ण और फ़ोटो सीमा के साथ।',
+          'Casemate Basic ₹2,999/माह: 50 पूर्ण ड्राफ्ट, प्रति अपलोड 80 फ़ोटो, 60,000 अक्षर प्रति चैट, अधिकतम 3 डिवाइस।',
+          'Casemate Pro ₹4,999/माह: मासिक AI उचित-उपयोग के अधीन असीमित ड्राफ्ट, प्रति अपलोड लगभग 200 फ़ोटो, बड़ी चैट, अधिकतम 5 डिवाइस।',
+          'वार्षिक ₹34,990/वर्ष प्रो के समान है। बारह महीने का प्रो ₹59,988 है, वार्षिक बचत ₹24,998 (लगभग 41.7%) कर से पहले।',
+          'भुगतान Razorpay से। पहुँच खाते पर दर्ज तिथि तक रहती है। ऐप में स्वतः नवीनीकरण नहीं है।',
         ],
       },
       {
