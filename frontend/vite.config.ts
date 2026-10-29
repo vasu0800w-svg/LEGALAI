@@ -1,9 +1,30 @@
 import path from 'path';
+import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const firebaseRequire = createRequire(path.join(__dirname, 'node_modules/firebase/package.json'));
+const firebasePkgs = [
+  '@firebase/app',
+  '@firebase/auth',
+  '@firebase/firestore',
+  '@firebase/storage',
+  '@firebase/app-check',
+  '@firebase/util',
+  '@firebase/component',
+  '@firebase/logger',
+  '@firebase/webchannel-wrapper',
+] as const;
+const firebaseAliases: Record<string, string> = {};
+for (const name of firebasePkgs) {
+  try {
+    firebaseAliases[name] = path.dirname(firebaseRequire.resolve(`${name}/package.json`));
+  } catch {
+    /* optional product not installed */
+  }
+}
 
 export default defineConfig(({ mode }) => {
   loadEnv(mode, process.cwd(), '');
@@ -34,9 +55,14 @@ export default defineConfig(({ mode }) => {
       chunkSizeWarningLimit: 2000,
     },
     plugins: [react()],
+    optimizeDeps: {
+      include: ['firebase/app', 'firebase/auth', 'firebase/firestore', 'firebase/storage'],
+    },
     resolve: {
+      dedupe: ['firebase', ...firebasePkgs],
       alias: {
         '@': path.resolve(__dirname, '.'),
+        ...firebaseAliases,
       },
     },
   };

@@ -1,4 +1,4 @@
-import React, { lazy, Suspense, useEffect, useState } from 'react';
+import React, { Component, useEffect, useState, type ErrorInfo, type ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { StatusBar, Style } from '@capacitor/status-bar';
 import { useAppContext } from './context/AppContext';
@@ -11,14 +11,24 @@ import { UpgradeModal } from './components/UpgradeModal';
 import { AdminDashboard } from './components/AdminDashboard';
 import { SubscriptionModal } from './components/SubscriptionModal';
 import { MockRazorpay } from './components/MockRazorpay';
+import { LandingPage } from './components/LandingPage';
 import { useNativeAppNavigation } from './utils/nativeNavigation';
 import { THEME_INK_DARK } from './utils/theme';
 
 const packagedForAndroid = import.meta.env.VITE_APP_TARGET === 'android';
 
-const LandingPage = packagedForAndroid
-  ? null
-  : lazy(() => import('./components/LandingPage').then((m) => ({ default: m.LandingPage })));
+class SiteErrorBoundary extends Component<{ children: ReactNode; fallback: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[casemate] website render failed', error, info.componentStack);
+  }
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
 
 const AppShell = () => {
   const {
@@ -98,14 +108,14 @@ const App = () => {
   }, []);
 
   if (!user) {
-    if (packagedForAndroid || Capacitor.isNativePlatform() || !LandingPage) {
+    if (packagedForAndroid || Capacitor.isNativePlatform()) {
       return <AuthScreen />;
     }
     if (!authMode) {
       return (
-        <Suspense fallback={<div className="h-full w-full bg-ink" aria-busy="true" aria-label="Loading Casemate" />}>
+        <SiteErrorBoundary fallback={<AuthScreen />}>
           <LandingPage onSignIn={() => setAuthMode('login')} onStart={() => setAuthMode('signup')} />
-        </Suspense>
+        </SiteErrorBoundary>
       );
     }
     return <AuthScreen startInSignup={authMode === 'signup'} onBack={() => setAuthMode(null)} />;
