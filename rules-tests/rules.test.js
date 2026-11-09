@@ -87,6 +87,7 @@ test.beforeEach(async () => {
     await db.doc('orders/order-alice').set({ uid: ALICE, amount: 1 });
     await db.doc('payments/pay-alice').set({ uid: ALICE, amount: 1 });
     await db.doc('auth_otps/otp-alice').set({ email: 'alice@example.com', code: 'hidden' });
+    await db.doc('site_stats/summary').set({ visits: 4, logins: 2, signups: 1 });
     const bucket = ctx.storage();
     await bucket.ref(`users/${ALICE}/chats/case-1/secret.pdf`).put(Buffer.from('alice-file'), {
       contentType: 'application/pdf',
@@ -154,4 +155,18 @@ test('anonymous storage access to User A files is denied', async () => {
 
 test('cross-user isolation assertions completed', () => {
   assert.equal(ALICE === BOB, false);
+});
+
+test('visitors can read and increment site_stats but cannot reset them', async () => {
+  const db = firestoreFor(null);
+  await assertSucceeds(db.doc('site_stats/summary').get());
+  await assertSucceeds(db.doc('site_stats/summary').set({ visits: 5, logins: 2, signups: 1 }));
+  await assertFails(db.doc('site_stats/summary').set({ visits: 0, logins: 0, signups: 0 }));
+});
+
+test('admin can list user directory and Bob cannot', async () => {
+  const adminDb = firestoreFor('adminUid', 'admin@casemate.com');
+  await assertSucceeds(adminDb.collection('user_directory').get());
+  const bobDb = firestoreFor(BOB, 'bob@example.com');
+  await assertFails(bobDb.collection('user_directory').get());
 });

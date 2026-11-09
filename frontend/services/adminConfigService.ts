@@ -1,5 +1,6 @@
 import { db, auth, getAppCheckHeader } from './firebaseService';
 import { doc, getDoc, setDoc, onSnapshot, Unsubscribe } from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
 import { isAdminEmail } from '../utils/adminIdentity';
 
 export type AppConfigDoc = 'plans' | 'announcement' | 'templates' | 'api_keys' | 'email_keys' | 'promo_codes';
@@ -42,7 +43,65 @@ const withTimeout = async <T,>(promise: Promise<T>, ms: number, label: string): 
  */
 export const ensureConfigWriteAuth = async (): Promise<boolean> => {
   clearLegacyAdminCreds();
-  return isAdminEmail(auth.currentUser?.email);
+  if (isAdminEmail(auth.currentUser?.email)) return true;
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (value: boolean) => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      unsub();
+      resolve(value);
+    };
+    const unsub = onAuthStateChanged(auth, (user) => {
+      if (isAdminEmail(user?.email)) finish(true);
+    });
+    const timer = window.setTimeout(() => finish(isAdminEmail(auth.currentUser?.email)), 8000);
+  });
+};
+
+export type AdminOverviewUser = {
+  id: string;
+  name: string;
+  email: string;
+  plan: string;
+  lastSeen: number;
+  createdAt: number;
+  lastSignInAt: number;
+  emailVerified: boolean;
+};
+
+export type AdminOverview = {
+  stats: { visits: number; logins: number; signups: number };
+  users: AdminOverviewUser[];
+};
+
+export const fetchAdminOverview = async (): Promise<AdminOverview | null> => {
+  clearLegacyAdminCreds();
+  const current = auth.currentUser;
+  if (!current || !isAdminEmail(current.email)) return null;
+  const base = apiBase();
+  if (!base) return null;
+  try {
+    const token = await current.getIdToken();
+    const appCheck = await getAppCheckHeader();
+    const res = await fetch(`${base}/api/admin/overview`, {
+      headers: { Authorization: `Bearer ${token}`, ...appCheck },
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    if (!body || body.ok !== true || !Array.isArray(body.users)) return null;
+    return {
+      stats: {
+        visits: Number(body.stats?.visits) || 0,
+        logins: Number(body.stats?.logins) || 0,
+        signups: Number(body.stats?.signups) || 0,
+      },
+      users: body.users,
+    };
+  } catch {
+    return null;
+  }
 };
 
 const apiBase = () =>

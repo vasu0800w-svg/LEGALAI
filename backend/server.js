@@ -29,6 +29,7 @@ import {
 import { attachAuthUser } from './lib/authUser.js';
 import { applyCors, applySecurityHeaders } from './lib/httpSecurity.js';
 import { requireAdmin } from './lib/adminAuth.js';
+import { adminOverviewHandler, adminOverviewOptionsHandler } from './routes/admin.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -78,6 +79,9 @@ app.get('/api/admin/session', attachAuthUser, async (req, res) => {
   if (!user) return;
   res.status(200).json({ ok: true });
 });
+
+app.options('/api/admin/overview', adminOverviewOptionsHandler);
+app.get('/api/admin/overview', attachAuthUser, adminOverviewHandler);
 
 // IMPORTANT: Vertex AI Studio Rate Limiting
 // This rate limiting configuration protects your backend APIs from abuse.

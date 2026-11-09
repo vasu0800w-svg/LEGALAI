@@ -92,7 +92,10 @@ service cloud.firestore {
     }
 
     match /site_stats/summary {
-      allow read: if isAdmin();
+      // Clients must read the current counts to add 1. These fields are
+      // aggregate totals only — no names, emails, or case data.
+      allow get: if true;
+      allow list: if isAdmin();
 
       allow create: if statsShape(request.resource.data)
         && (

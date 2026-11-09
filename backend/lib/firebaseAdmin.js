@@ -83,6 +83,10 @@ if (db) {
 export const adminReady = () => db !== null;
 export const adminInitError = () => initError;
 export const getDb = () => db;
+export const getAdminAuth = () => {
+  if (!app) throw new Error('Firebase Admin app not initialised');
+  return getAuth(app);
+};
 export const userDoc = (uid) => db.collection('users_data').doc(uid);
 export const orderDoc = (orderId) => db.collection('orders').doc(orderId);
 export const paymentDoc = (paymentId) => db.collection('payments').doc(String(paymentId || ''));

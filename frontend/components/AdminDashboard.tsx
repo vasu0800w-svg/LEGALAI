@@ -5,7 +5,7 @@ import { BrandLogo } from './BrandLogo';
 import { translations } from '../utils/translations';
 import { EmailAuthProvider, reauthenticateWithCredential, updatePassword } from 'firebase/auth';
 import { auth } from '../services/firebaseService';
-import { saveAppConfig, getAppConfig, saveCloudAdminConfig, saveAppConfigDetailed, CloudLegalTemplate, ensureConfigWriteAuth, verifyAdminSession } from '../services/adminConfigService';
+import { saveAppConfig, getAppConfig, saveCloudAdminConfig, saveAppConfigDetailed, CloudLegalTemplate, ensureConfigWriteAuth, verifyAdminSession, fetchAdminOverview } from '../services/adminConfigService';
 import { ADMIN_EMAIL } from '../utils/adminIdentity';
 import { PLAN_FEATURES, DEFAULT_PLAN_PRICES, UNLIMITED_EMAIL_LIST, isUnlimitedEmail, sanitizeSubscriptionPlans, sanitizeFreePlanLimits, DEFAULT_FREE_PLAN_LIMITS, applyFreePlanConfig, PlanLimits } from '../utils/planLimits';
 import { subscribeUserDirectory, DirectoryUser } from '../services/userDirectoryService';
@@ -19,6 +19,8 @@ interface UserStats {
   plan: string;
   lastSeen: number;
   createdAt: number;
+  lastSignInAt?: number;
+  emailVerified?: boolean;
 }
 
 interface PlanConfig {
@@ -27,6 +29,27 @@ interface PlanConfig {
   price: number;
   features: string[];
 }
+
+const mergeDirectoryUsers = (base: UserStats[], live: DirectoryUser[]): UserStats[] => {
+  if (!live.length) return base;
+  const map = new Map(base.map((row) => [row.id, row]));
+  for (const row of live) {
+    const prev = map.get(row.id);
+    map.set(row.id, {
+      id: row.id,
+      name: row.name || prev?.name || 'Advocate',
+      email: row.email || prev?.email || '',
+      plan: row.plan || prev?.plan || 'free',
+      lastSeen: Math.max(row.lastSeen || 0, prev?.lastSeen || 0),
+      createdAt: prev?.createdAt || row.createdAt || 0,
+      lastSignInAt: prev?.lastSignInAt || 0,
+      emailVerified: prev?.emailVerified,
+    });
+  }
+  return [...map.values()].sort(
+    (a, b) => (b.lastSeen || b.lastSignInAt || b.createdAt || 0) - (a.lastSeen || a.lastSignInAt || a.createdAt || 0)
+  );
+};
 
 export const AdminDashboard = () => {
   const { logout, language } = useAppContext();
@@ -108,48 +131,59 @@ export const AdminDashboard = () => {
     }
 
     void (async () => {
-      const started = Date.now();
-      while (!auth.currentUser && Date.now() - started < 4000) {
-        await new Promise((r) => setTimeout(r, 150));
-        if (cancelled) return;
+      const okAuth = await ensureConfigWriteAuth();
+      if (cancelled) return;
+      if (!okAuth) {
+        setDirectoryError('Admin Firebase sign-in failed. Log out, then sign in again with the admin email and password that exist in Firebase Authentication.');
+        setSiteStatsError('Admin Firebase sign-in failed, so visit and login counts cannot load.');
+        setDirectoryReady(true);
+        void logout();
+        return;
       }
-      const ok = await verifyAdminSession();
-      if (!cancelled && !ok) void logout();
-    })();
+      const sessionOk = await verifyAdminSession();
+      if (cancelled) return;
+      if (!sessionOk) {
+        void logout();
+        return;
+      }
 
-    void ensureConfigWriteAuth()
-      .then((ok) => {
-        if (cancelled) return;
-        if (!ok) {
-          setDirectoryError('Admin Firebase sign-in failed. Log out, then sign in again with the admin email and password that exist in Firebase Authentication.');
-          setSiteStatsError('Admin Firebase sign-in failed, so visit and login counts cannot load.');
-          setDirectoryReady(true);
+      const overview = await fetchAdminOverview();
+      if (cancelled) return;
+      if (overview) {
+        setSiteStats(overview.stats);
+        setStats(overview.users);
+        setDirectoryError('');
+        setSiteStatsError('');
+      }
+
+      unsubSiteStats = subscribeSiteStats((next, error) => {
+        if (error) {
+          if (!overview) setSiteStatsError(error);
           return;
         }
-        unsubSiteStats = subscribeSiteStats((next, error) => {
-          setSiteStats(next);
-          setSiteStatsError(error || '');
-        });
-        void getAppConfig<{ code14?: string; codeAlways?: string }>('promo_codes').then((data) => {
-          if (cancelled) return;
-          setPromo14(String(data?.code14 || ''));
-          setPromoAlways(String(data?.codeAlways || ''));
-        }).catch(() => {});
-        unsubDirectory = subscribeUserDirectory((users: DirectoryUser[], error) => {
-          setDirectoryReady(true);
-          if (error) {
-            setDirectoryError(error);
-            return;
-          }
-          setDirectoryError('');
-          setStats(users);
-        });
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setDirectoryError('Could not load live users.');
-        setDirectoryReady(true);
+        setSiteStats(next);
+        setSiteStatsError('');
       });
+      void getAppConfig<{ code14?: string; codeAlways?: string }>('promo_codes').then((data) => {
+        if (cancelled) return;
+        setPromo14(String(data?.code14 || ''));
+        setPromoAlways(String(data?.codeAlways || ''));
+      }).catch(() => {});
+      unsubDirectory = subscribeUserDirectory((users: DirectoryUser[], error) => {
+        setDirectoryReady(true);
+        if (error) {
+          if (!overview) setDirectoryError(error);
+          return;
+        }
+        setDirectoryError('');
+        setStats((prev) => mergeDirectoryUsers(prev, users));
+      });
+      setDirectoryReady(true);
+    })().catch(() => {
+      if (cancelled) return;
+      setDirectoryError('Could not load live users.');
+      setDirectoryReady(true);
+    });
 
     // Load plans — prefer cloud so admin phone matches all users
     (async () => {
@@ -217,6 +251,11 @@ export const AdminDashboard = () => {
     if (diff < 2 * 60 * 1000) return 'Online now';
     if (diff < 60 * 60 * 1000) return `${Math.max(1, Math.floor(diff / 60000))} min ago`;
     if (diff < 24 * 60 * 60 * 1000) return `${Math.floor(diff / 3600000)} hr ago`;
+    return new Date(ts).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
+  };
+
+  const formatStamp = (ts: number) => {
+    if (!ts) return '—';
     return new Date(ts).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
   };
 
@@ -560,6 +599,8 @@ export const AdminDashboard = () => {
                   <th className="px-6 py-4 font-medium">{t.userName}</th>
                   <th className="px-6 py-4 font-medium">{t.email}</th>
                   <th className="px-6 py-4 font-medium">{t.plan}</th>
+                  <th className="px-6 py-4 font-medium">Signed up</th>
+                  <th className="px-6 py-4 font-medium">Last sign-in</th>
                   <th className="px-6 py-4 font-medium">Last active</th>
                   <th className="px-6 py-4 font-medium">Status</th>
                 </tr>
@@ -567,8 +608,8 @@ export const AdminDashboard = () => {
               <tbody className="divide-y divide-ink-border/80">
                 {stats.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-6 py-8 text-center text-band-mute italic">
-                      {directoryReady ? 'No one has opened the app since live tracking started.' : 'Loading users…'}
+                    <td colSpan={7} className="px-6 py-8 text-center text-band-mute italic">
+                      {directoryReady ? 'No signed-in accounts yet.' : 'Loading users…'}
                     </td>
                   </tr>
                 ) : (
@@ -578,7 +619,12 @@ export const AdminDashboard = () => {
                     return (
                     <tr key={user.id} className="hover:bg-ink-muted/40 transition-colors">
                       <td className="px-6 py-4 font-medium text-white">{user.name}</td>
-                      <td className="px-6 py-4 text-band-mute">{user.email}</td>
+                      <td className="px-6 py-4 text-band-mute">
+                        <div>{user.email}</div>
+                        {user.emailVerified ? (
+                          <div className="text-[11px] text-green-400 mt-0.5">Email verified</div>
+                        ) : null}
+                      </td>
                       <td className="px-6 py-4">
                         <span className={`px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wide ${
                           unlimited || user.plan !== 'free' ? 'bg-yellow-900/30 text-yellow-400 border border-yellow-800/50' : 'bg-ink-muted text-band-dim border border-ink-border'
@@ -586,6 +632,8 @@ export const AdminDashboard = () => {
                           {unlimited ? 'unlimited' : user.plan}
                         </span>
                       </td>
+                      <td className="px-6 py-4 text-band-mute text-xs">{formatStamp(user.createdAt)}</td>
+                      <td className="px-6 py-4 text-band-mute text-xs">{formatStamp(user.lastSignInAt || 0)}</td>
                       <td className="px-6 py-4 text-band-mute text-xs">
                         {formatLastSeen(user.lastSeen)}
                       </td>
