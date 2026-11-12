@@ -3488,7 +3488,7 @@ const ChatMessageList = memo(function ChatMessageList({
                   ? 'bg-white text-black rounded-tr-sm text-[15px]'
                   : msg.isDocument
                     ? 'bg-ink-muted border border-ink-border text-band-dim rounded-tl-sm'
-                    : 'bg-ink-muted border border-ink-border text-band rounded-tl-sm text-[16.5px] sm:text-[17px] font-medium tracking-[0.01em]'
+                    : 'chat-ai-bubble rounded-tl-sm text-[16.5px] sm:text-[17px] tracking-[0.01em]'
               }`}>
                 {msg.isDocument ? (
                   <DocumentViewer
@@ -3569,7 +3569,7 @@ const ChatMessageList = memo(function ChatMessageList({
                     type="button"
                     disabled={isLoading}
                     onClick={() => onSuggest(question)}
-                    className="w-full text-left px-3 py-2.5 rounded-xl bg-ink border border-ink-border text-sm text-band hover:bg-white/5 disabled:opacity-50 flex items-start gap-2"
+                    className="chat-ai-suggest w-full text-left px-3 py-2.5 rounded-xl text-sm hover:bg-white/5 disabled:opacity-50 flex items-start gap-2"
                   >
                     <span aria-hidden="true" className="mt-0.5">💡</span>
                     <span>{question}</span>
@@ -3594,7 +3594,7 @@ const ChatMessageList = memo(function ChatMessageList({
           <div className="w-8 h-8 rounded-full overflow-hidden border border-ink-border flex items-center justify-center flex-shrink-0 mt-1 bg-black">
             <BrandLogo size={32} />
           </div>
-          <div className="bg-ink-muted border border-ink-border px-5 py-4 rounded-2xl rounded-tl-sm flex flex-col gap-2 max-w-[85%]">
+          <div className="chat-ai-bubble px-5 py-4 rounded-2xl rounded-tl-sm flex flex-col gap-2 max-w-[85%]">
             <div className="flex items-center gap-1.5">
               <span className="typing-band" style={{ animationDelay: '0ms' }} />
               <span className="typing-band" style={{ animationDelay: '160ms' }} />
