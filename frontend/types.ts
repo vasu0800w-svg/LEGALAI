@@ -8,7 +8,7 @@ export interface User {
   id: string;
   name: string;
   email: string;
-  plan: 'free' | 'basic' | 'pro' | 'annual' | 'custom';
+  plan: 'free' | 'starter' | 'basic' | 'pro' | 'annual' | 'custom';
   customPlan?: {
     selection?: {
       photoUpload?: number;

@@ -24,6 +24,7 @@ test('live add-on lists still receive chat-limit SKUs when they were omitted', (
 });
 
 test('shipped list prices match the published catalog', () => {
+  assert.equal(DEFAULT_PLAN_PRICES.starter, 999);
   assert.equal(DEFAULT_PLAN_PRICES.basic, 2999);
   assert.equal(DEFAULT_PLAN_PRICES.pro, 4999);
   assert.equal(DEFAULT_PLAN_PRICES.annual, 34990);

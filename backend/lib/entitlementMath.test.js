@@ -50,6 +50,8 @@ test('buying a lower plan while a higher plan is active keeps the higher plan', 
   const expiry = now + 20 * 86400000;
   assert.equal(nextPlanAfterPurchase('pro', expiry, 'basic', now), 'pro');
   assert.equal(nextPlanAfterPurchase('basic', expiry, 'pro', now), 'pro');
+  assert.equal(nextPlanAfterPurchase('basic', expiry, 'starter', now), 'basic');
+  assert.equal(nextPlanAfterPurchase('starter', expiry, 'basic', now), 'basic');
   assert.equal(nextPlanAfterPurchase('pro', now - 1000, 'basic', now), 'basic');
   assert.equal(nextPlanAfterPurchase('pro', expiry, 'custom', now), 'pro');
   assert.equal(nextPlanAfterPurchase('free', expiry, 'custom', now), 'custom');

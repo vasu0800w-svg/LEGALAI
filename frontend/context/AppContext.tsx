@@ -22,6 +22,7 @@ export interface SubscriptionPlanConfig {
 }
 
 const DEFAULT_SUBSCRIPTION_PLANS: SubscriptionPlanConfig[] = [
+  { id: 'starter', name: 'Casemate Starter', price: DEFAULT_PLAN_PRICES.starter, features: [...PLAN_FEATURES.starter] },
   { id: 'basic', name: 'Casemate Basic', price: DEFAULT_PLAN_PRICES.basic, features: [...PLAN_FEATURES.basic] },
   { id: 'pro', name: 'Casemate Pro', price: DEFAULT_PLAN_PRICES.pro, features: [...PLAN_FEATURES.pro] },
   { id: 'annual', name: 'Annual Plan', price: DEFAULT_PLAN_PRICES.annual, features: [...PLAN_FEATURES.annual] },
@@ -1651,7 +1652,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   const upgradeToPro = useCallback(async (planId: string = 'pro', serverExpiry?: number | null) => {
     const u = userRef.current;
     if (!u) return;
-    const validPlan = (['basic', 'pro', 'annual', 'custom'].includes(planId) ? planId : 'pro') as User['plan'];
+    const validPlan = (['starter', 'basic', 'pro', 'annual', 'custom'].includes(planId) ? planId : 'pro') as User['plan'];
     const days = validPlan === 'annual' ? 365 : 30;
     const expiryDate = serverExpiry && serverExpiry > Date.now()
       ? serverExpiry

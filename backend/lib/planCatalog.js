@@ -13,6 +13,7 @@ import {
 } from '../middleware/planLimits.js';
 
 export const PLAN_DURATION_DAYS = {
+  starter: 30,
   basic: 30,
   pro: 30,
   annual: 365,
@@ -20,6 +21,7 @@ export const PLAN_DURATION_DAYS = {
 };
 
 export const DEFAULT_PLAN_PRICES = {
+  starter: 999,
   basic: 2999,
   pro: 4999,
   annual: 34990,
@@ -42,6 +44,20 @@ const UNLIMITED_LIMITS = {
 
 /** Current catalog for new purchases. Existing paid users are grandfathered in getPlanLimits. */
 export const DEFAULT_PAID_LIMITS = {
+  starter: {
+    draftLimit: 30,
+    maxMessageChars: 10000,
+    maxSessionChars: 40000,
+    chatSessionLimit: 100,
+    dailyUses: Number.POSITIVE_INFINITY,
+    dailyAiRequests: Number.POSITIVE_INFINITY,
+    dailySeconds: 0,
+    maxPhotosPerChat: Number.POSITIVE_INFINITY,
+    maxPhotosPerUpload: 50,
+    monthlyAiRequests: 2000,
+    monthlyImages: 2000,
+    maxDevices: 2,
+  },
   basic: {
     draftLimit: 50,
     maxMessageChars: 10000,
@@ -128,12 +144,13 @@ const finiteOr = (value, fallback) => {
 
 export const sanitizePaidLimits = (raw) => {
   const out = {
+    starter: { ...DEFAULT_PAID_LIMITS.starter },
     basic: { ...DEFAULT_PAID_LIMITS.basic },
     pro: { ...DEFAULT_PAID_LIMITS.pro },
     annual: { ...DEFAULT_PAID_LIMITS.annual },
   };
   if (!raw || typeof raw !== 'object') return out;
-  for (const id of ['basic', 'pro', 'annual']) {
+  for (const id of ['starter', 'basic', 'pro', 'annual']) {
     const hit = raw[id];
     if (!hit || typeof hit !== 'object') continue;
     const base = out[id];
@@ -183,6 +200,7 @@ let cache = { at: 0, catalog: null };
 
 export const emptyCatalog = () => ({
   plans: [
+    { id: 'starter', name: 'Casemate Starter', price: DEFAULT_PLAN_PRICES.starter, billingDays: 30, features: [] },
     { id: 'basic', name: 'Basic Plan', price: DEFAULT_PLAN_PRICES.basic, billingDays: 30, features: [] },
     { id: 'pro', name: 'Pro Plan', price: DEFAULT_PLAN_PRICES.pro, billingDays: 30, features: [] },
     { id: 'annual', name: 'Annual Plan', price: DEFAULT_PLAN_PRICES.annual, billingDays: 365, features: [] },
@@ -213,6 +231,15 @@ export async function loadPlanCatalog() {
         features: Array.isArray(p?.features) ? p.features : [],
       };
     });
+    if (!plans.some((p) => p.id === 'starter')) {
+      plans.unshift({
+        id: 'starter',
+        name: 'Casemate Starter',
+        price: DEFAULT_PLAN_PRICES.starter,
+        billingDays: 30,
+        features: [],
+      });
+    }
     const freeLimits = sanitizeFreePlanLimits(data.freeLimits);
     freeLimits.maxPhotosPerUpload = finiteOr(data.freeLimits?.maxPhotosPerUpload, 20);
     const catalog = {
@@ -248,7 +275,7 @@ export function limitsFor(plan, email, userData, codes, catalog) {
     } else {
       limits = base;
     }
-  } else if (p === 'basic' || p === 'pro' || p === 'annual') {
+  } else if (p === 'starter' || p === 'basic' || p === 'pro' || p === 'annual') {
     const catalogLimits = cat.paidLimits[p] || DEFAULT_PAID_LIMITS[p] || DEFAULT_PAID_LIMITS.pro;
     limits = catalogLimits;
   } else {

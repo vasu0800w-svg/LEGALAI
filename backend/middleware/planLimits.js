@@ -72,6 +72,20 @@ export const sanitizeFreePlanLimits = (raw) => {
 
 /** Limits already granted to paid accounts before Part 5. Do not apply to them automatically. */
 export const LEGACY_PAID_LIMITS = {
+  starter: {
+    draftLimit: 30,
+    maxMessageChars: 10000,
+    maxSessionChars: 40000,
+    chatSessionLimit: 100,
+    dailyUses: Number.POSITIVE_INFINITY,
+    dailyAiRequests: Number.POSITIVE_INFINITY,
+    dailySeconds: 0,
+    maxPhotosPerChat: Number.POSITIVE_INFINITY,
+    maxPhotosPerUpload: 50,
+    monthlyAiRequests: 2000,
+    monthlyImages: 2000,
+    maxDevices: 2,
+  },
   basic: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 10000,
@@ -105,6 +119,20 @@ LEGACY_PAID_LIMITS.annual = { ...LEGACY_PAID_LIMITS.pro };
 
 /** Current catalog for new purchases. Admin paidLimits may override. */
 const DEFAULT_PAID_LIMITS = {
+  starter: {
+    draftLimit: 30,
+    maxMessageChars: 10000,
+    maxSessionChars: 40000,
+    chatSessionLimit: 100,
+    dailyUses: Number.POSITIVE_INFINITY,
+    dailyAiRequests: Number.POSITIVE_INFINITY,
+    dailySeconds: 0,
+    maxPhotosPerChat: Number.POSITIVE_INFINITY,
+    maxPhotosPerUpload: 50,
+    monthlyAiRequests: 2000,
+    monthlyImages: 2000,
+    maxDevices: 2,
+  },
   basic: {
     draftLimit: 50,
     maxMessageChars: 10000,
@@ -141,12 +169,13 @@ let freeCache = { at: 0, limits: sanitizeFreePlanLimits(null), paid: { ...DEFAUL
 
 const mergePaid = (raw) => {
   const out = {
+    starter: { ...DEFAULT_PAID_LIMITS.starter },
     basic: { ...DEFAULT_PAID_LIMITS.basic },
     pro: { ...DEFAULT_PAID_LIMITS.pro },
     annual: { ...DEFAULT_PAID_LIMITS.annual },
   };
   if (!raw || typeof raw !== 'object') return out;
-  for (const id of ['basic', 'pro', 'annual']) {
+  for (const id of ['starter', 'basic', 'pro', 'annual']) {
     const hit = raw[id];
     if (!hit || typeof hit !== 'object') continue;
     out[id] = { ...out[id], ...hit, dailyUses: Number.POSITIVE_INFINITY };
@@ -211,7 +240,7 @@ export function getPlanLimits(plan, email, userData = null, codes = null) {
     } else {
       limits = base;
     }
-  } else if (p === 'basic' || p === 'pro' || p === 'annual') {
+  } else if (p === 'starter' || p === 'basic' || p === 'pro' || p === 'annual') {
     const catalogLimits = paid[p] || DEFAULT_PAID_LIMITS[p] || DEFAULT_PAID_LIMITS.pro;
     const legacyLimits = LEGACY_PAID_LIMITS[p] || LEGACY_PAID_LIMITS.pro;
     limits = resolvePaidLimits({
@@ -230,12 +259,14 @@ export function getPlanLimits(plan, email, userData = null, codes = null) {
 
 /** Authoritative monthly price per plan (rupees). Admin config may override. */
 export const DEFAULT_PLAN_PRICES = {
+  starter: 999,
   basic: 2999,
   pro: 4999,
   annual: 34990,
 };
 
 export const PLAN_DURATION_DAYS = {
+  starter: 30,
   basic: 30,
   pro: 30,
   annual: 365,

@@ -80,6 +80,7 @@ export const AdminDashboard = () => {
 
   // Dynamic Plans with customizable features & add/remove support
   const [plans, setPlans] = useState<PlanConfig[]>([
+    { id: 'starter', name: 'Casemate Starter', price: DEFAULT_PLAN_PRICES.starter, features: [...PLAN_FEATURES.starter] },
     { id: 'basic', name: 'Casemate Basic', price: DEFAULT_PLAN_PRICES.basic, features: [...PLAN_FEATURES.basic] },
     { id: 'pro', name: 'Casemate Pro', price: DEFAULT_PLAN_PRICES.pro, features: [...PLAN_FEATURES.pro] },
     { id: 'annual', name: 'Annual Plan', price: DEFAULT_PLAN_PRICES.annual, features: [...PLAN_FEATURES.annual] }

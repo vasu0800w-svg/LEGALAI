@@ -29,7 +29,7 @@ import {
 
 const cors = (req, res) => applyCors(req, res, 'POST, OPTIONS');
 
-const VALID_PLANS = ['basic', 'pro', 'annual'];
+const VALID_PLANS = ['starter', 'basic', 'pro', 'annual'];
 
 const pairFrom = (id, secret) => {
   const key_id = String(id || '').trim();

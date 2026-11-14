@@ -29,7 +29,7 @@ export const reviveLimits = (stored, fallback) => {
   return base;
 };
 
-export const PLAN_RANK = { free: 0, custom: 1, basic: 1, pro: 2, annual: 2 };
+export const PLAN_RANK = { free: 0, starter: 1, custom: 1, basic: 2, pro: 3, annual: 3 };
 
 /** Catalog written at Part 5. Existing paid users without this version keep legacy limits. */
 export const CATALOG_VERSION = 5;

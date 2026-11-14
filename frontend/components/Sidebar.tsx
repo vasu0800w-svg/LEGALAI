@@ -46,6 +46,7 @@ export const Sidebar = () => {
 
   const t = translations[language] || translations['English'];
   const plans = subscriptionPlans.length > 0 ? subscriptionPlans : [
+    { id: 'starter', name: 'Casemate Starter', price: DEFAULT_PLAN_PRICES.starter },
     { id: 'basic', name: 'Basic Plan', price: DEFAULT_PLAN_PRICES.basic },
     { id: 'pro', name: 'Pro Plan', price: DEFAULT_PLAN_PRICES.pro },
     { id: 'annual', name: 'Annual Plan', price: DEFAULT_PLAN_PRICES.annual }

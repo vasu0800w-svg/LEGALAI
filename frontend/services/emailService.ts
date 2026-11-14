@@ -293,7 +293,10 @@ export const checkAndSendExpiryReminder = async (user: {
     if (localStorage.getItem(storageKey) === '1') return;
 
     const planName =
-      user.plan === 'basic' ? 'Basic Plan' : user.plan === 'annual' ? 'Annual Plan' : 'Pro Plan';
+      user.plan === 'starter' ? 'Casemate Starter'
+        : user.plan === 'basic' ? 'Basic Plan'
+        : user.plan === 'annual' ? 'Annual Plan'
+        : 'Pro Plan';
 
     const ok = await sendExpiryAlertEmail(user.email, user.name || 'Advocate', daysLeft, planName);
     if (ok) {

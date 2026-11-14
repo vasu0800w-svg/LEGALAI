@@ -1,4 +1,8 @@
-export type PlanId = 'free' | 'basic' | 'pro' | 'annual' | 'custom';
+export type PaidPlanId = 'starter' | 'basic' | 'pro' | 'annual';
+export type PlanId = 'free' | PaidPlanId | 'custom';
+export const PAID_PLAN_IDS: PaidPlanId[] = ['starter', 'basic', 'pro', 'annual'];
+export const isPaidPlanId = (id: string): id is PaidPlanId =>
+  (PAID_PLAN_IDS as string[]).includes(id);
 
 export interface PlanLimits {
   draftLimit: number;
@@ -131,7 +135,21 @@ let freePlanOverride: PlanLimits | null = null;
 
 export const CATALOG_VERSION = 5;
 
-export const LEGACY_PAID_LIMITS: Record<'basic' | 'pro' | 'annual', PlanLimits> = {
+export const LEGACY_PAID_LIMITS: Record<PaidPlanId, PlanLimits> = {
+  starter: {
+    draftLimit: 30,
+    maxMessageChars: 10000,
+    maxSessionChars: 40000,
+    chatSessionLimit: 100,
+    dailyUses: Number.POSITIVE_INFINITY,
+    dailyAiRequests: Number.POSITIVE_INFINITY,
+    dailySeconds: 0,
+    maxPhotosPerChat: Number.POSITIVE_INFINITY,
+    maxPhotosPerUpload: 50,
+    monthlyAiRequests: 2000,
+    monthlyImages: 2000,
+    maxDevices: 2,
+  },
   basic: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 10000,
@@ -176,7 +194,8 @@ export const LEGACY_PAID_LIMITS: Record<'basic' | 'pro' | 'annual', PlanLimits> 
   },
 };
 
-export const DEFAULT_PAID_LIMITS: Record<'basic' | 'pro' | 'annual', PlanLimits> = {
+export const DEFAULT_PAID_LIMITS: Record<PaidPlanId, PlanLimits> = {
+  starter: { ...LEGACY_PAID_LIMITS.starter },
   basic: {
     draftLimit: 50,
     maxMessageChars: 10000,
@@ -272,6 +291,7 @@ export const applyPaidPlanConfig = (raw: Record<string, Partial<PlanLimits>> | n
     return;
   }
   paidPlanOverride = {
+    starter: { ...DEFAULT_PAID_LIMITS.starter, ...(raw.starter || {}) },
     basic: { ...DEFAULT_PAID_LIMITS.basic, ...(raw.basic || {}) },
     pro: { ...DEFAULT_PAID_LIMITS.pro, ...(raw.pro || {}) },
     annual: { ...DEFAULT_PAID_LIMITS.annual, ...(raw.annual || {}) },
@@ -313,7 +333,7 @@ const qty = (n: number, infiniteLabel: string, finite: (v: number) => string) =>
   Number.isFinite(n) ? finite(n) : infiniteLabel;
 
 export const catalogLimitsFor = (planId: string, free: PlanLimits = DEFAULT_FREE_PLAN_LIMITS): PlanLimits => {
-  if (planId === 'basic' || planId === 'pro' || planId === 'annual') {
+  if (isPaidPlanId(planId)) {
     return paidPlanOverride?.[planId] || DEFAULT_PAID_LIMITS[planId];
   }
   return freePlanOverride || free;
@@ -334,25 +354,34 @@ export const paidFeatureLines = (planId: string, limits: PlanLimits): string[] =
       `Fair use: ${limits.monthlyAiRequests.toLocaleString('en-IN')} AI requests and ${limits.monthlyImages.toLocaleString('en-IN')} photo analyses each month`
     );
   }
+  if (planId === 'starter') {
+    const uploadIdx = lines.indexOf(upload);
+    if (uploadIdx >= 0) lines.splice(uploadIdx + 1, 0, 'No per-chat photo cap');
+    const deviceIdx = lines.indexOf(devices);
+    if (deviceIdx >= 0) lines.splice(deviceIdx, 0, 'No daily AI cap');
+  }
   if (planId === 'annual') lines.unshift('Same features as Casemate Pro, billed once a year');
   if (planId === 'pro') lines.push('All supported premium drafting and analysis tools');
   return lines;
 };
 
 /** Feature bullets shown on subscription / upgrade / admin UIs — derived from catalog limits. */
-export const PLAN_FEATURES: Record<'basic' | 'pro' | 'annual', string[]> = {
+export const PLAN_FEATURES: Record<PaidPlanId, string[]> = {
+  starter: paidFeatureLines('starter', DEFAULT_PAID_LIMITS.starter),
   basic: paidFeatureLines('basic', DEFAULT_PAID_LIMITS.basic),
   pro: paidFeatureLines('pro', DEFAULT_PAID_LIMITS.pro),
   annual: paidFeatureLines('annual', DEFAULT_PAID_LIMITS.annual),
 };
 
 export const DEFAULT_PLAN_PRICES: Record<string, number> = {
+  starter: 999,
   basic: 2999,
   pro: 4999,
   annual: 34990,
 };
 
 export const PLAN_DURATION_DAYS: Record<string, number> = {
+  starter: 30,
   basic: 30,
   pro: 30,
   annual: 365,
@@ -361,6 +390,7 @@ export const PLAN_DURATION_DAYS: Record<string, number> = {
 
 export const PLAN_DISPLAY_NAMES: Record<string, string> = {
   free: 'Free Plan',
+  starter: 'Casemate Starter',
   basic: 'Casemate Basic',
   pro: 'Casemate Pro',
   annual: 'Annual Plan',
@@ -449,14 +479,15 @@ export const buildPlanCards = (
 export const sanitizeSubscriptionPlans = (
   plans: Array<Partial<SubscriptionPlanShape>> | null | undefined
 ): SubscriptionPlanShape[] => {
-  if (!Array.isArray(plans) || plans.length === 0) {
-    return [
-      { id: 'basic', name: PLAN_DISPLAY_NAMES.basic, price: DEFAULT_PLAN_PRICES.basic, features: [...PLAN_FEATURES.basic] },
-      { id: 'pro', name: PLAN_DISPLAY_NAMES.pro, price: DEFAULT_PLAN_PRICES.pro, features: [...PLAN_FEATURES.pro] },
-      { id: 'annual', name: PLAN_DISPLAY_NAMES.annual, price: DEFAULT_PLAN_PRICES.annual, features: [...PLAN_FEATURES.annual] },
-    ];
-  }
-  return plans.map((p, i) => {
+  const catalogFallback = (): SubscriptionPlanShape[] =>
+    PAID_PLAN_IDS.map((id) => ({
+      id,
+      name: PLAN_DISPLAY_NAMES[id],
+      price: DEFAULT_PLAN_PRICES[id],
+      features: [...PLAN_FEATURES[id]],
+    }));
+  if (!Array.isArray(plans) || plans.length === 0) return catalogFallback();
+  const mapped = plans.map((p, i) => {
     const id = String(p?.id || `plan_${i + 1}`);
     const name = String(p?.name || 'Plan').trim() || 'Plan';
     const n = Number(p?.price);
@@ -468,6 +499,15 @@ export const sanitizeSubscriptionPlans = (
       : known ? [...known] : [];
     return { id, name, price, features };
   });
+  if (!mapped.some((p) => p.id === 'starter')) {
+    mapped.unshift({
+      id: 'starter',
+      name: PLAN_DISPLAY_NAMES.starter,
+      price: DEFAULT_PLAN_PRICES.starter,
+      features: [...PLAN_FEATURES.starter],
+    });
+  }
+  return mapped;
 };
 
 /** Plan-wise draft, message, and session character limits */
@@ -487,7 +527,7 @@ export const getPlanLimits = (plan?: string | null, email?: string | null, promo
     }
     return applyAddOns(base, promo);
   }
-  if (p === 'basic' || p === 'pro' || p === 'annual') {
+  if (isPaidPlanId(p)) {
     const catalogLimits = paidPlanOverride?.[p] || DEFAULT_PAID_LIMITS[p] || DEFAULT_PAID_LIMITS.pro;
     const legacyLimits = LEGACY_PAID_LIMITS[p] || LEGACY_PAID_LIMITS.pro;
     const granted = promo?.grantedLimits;

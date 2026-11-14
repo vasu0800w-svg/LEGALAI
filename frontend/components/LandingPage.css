@@ -45,7 +45,7 @@
   transform: none;
 }
 
-.cm-tester-overlay {
+.cm-install-overlay {
   position: fixed;
   inset: 0;
   z-index: 80;
@@ -56,30 +56,30 @@
   background: var(--overlay);
   overflow-y: auto;
 }
-.cm-tester-modal {
+.cm-install-modal {
   position: relative;
-  width: min(560px, 100%);
+  width: min(480px, 100%);
   background: #fff;
   border: 1px solid #e6e1d8;
   border-radius: 24px;
   padding: 36px 28px 28px;
   box-shadow: 0 24px 60px rgba(10, 10, 10, 0.16);
 }
-.cm-tester-modal h2 {
+.cm-install-modal h2 {
   margin: 0 0 10px;
   font-size: clamp(28px, 5vw, 40px);
 }
-.cm-tester-modal > p {
+.cm-install-modal > p {
   color: #4b4b4b;
   font-size: 15px;
   line-height: 1.55;
   margin: 0 0 20px;
 }
-.cm-tester-modal-actions {
+.cm-install-modal-actions {
   display: grid;
   gap: 10px;
 }
-.cm-tester-close {
+.cm-install-close {
   position: absolute;
   top: 10px;
   right: 12px;
@@ -93,7 +93,7 @@
   cursor: pointer;
   border-radius: 999px;
 }
-.cm-tester-close:hover { background: #f3f0ea; }
+.cm-install-close:hover { background: #f3f0ea; }
 
 .cm-land * { box-sizing: border-box; }
 
@@ -290,9 +290,9 @@
 }
 .cm-values,
 .cm-grid { grid-template-columns: repeat(4, 1fr); }
-.cm-prices { grid-template-columns: repeat(4, 1fr); align-items: stretch; }
+.cm-prices { grid-template-columns: repeat(5, minmax(0, 1fr)); align-items: stretch; }
 
-.cm-value, .cm-card, .cm-step, .cm-price, .cm-trust, .cm-custom, .cm-tester {
+.cm-value, .cm-card, .cm-step, .cm-price, .cm-trust, .cm-custom {
   background: #fff;
   border: 1px solid #e6e1d8;
   border-radius: 22px;
@@ -316,15 +316,6 @@
 .cm-steps-flow { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .cm-steps-flow .cm-step h3 { font-size: 20px; }
 .cm-step .cm-btn { margin-top: 16px; }
-.cm-btn.cm-point {
-  outline: 3px solid #0a0a0a;
-  outline-offset: 4px;
-  box-shadow: 0 0 0 8px rgba(10, 10, 10, 0.12);
-  animation: cm-point 1s ease-in-out 3;
-}
-@keyframes cm-point {
-  50% { transform: translateY(-2px); }
-}
 .cm-num { color: #0a0a0a; font-family: "Cormorant Garamond", Georgia, serif; font-size: 28px; }
 
 .cm-trust { padding: 28px; max-width: 760px; }
@@ -344,7 +335,7 @@
 .cm-specs dd { color: #0a0a0a; margin: 0; text-align: right; }
 .cm-price .cm-btn { margin-top: auto; }
 
-.cm-custom, .cm-tester {
+.cm-custom {
   margin-top: 14px;
   padding: 28px;
   display: grid;
@@ -357,7 +348,6 @@
 }
 .cm-builder { display: grid; gap: 16px; }
 .cm-builder button { font: inherit; }
-.cm-tester { margin-top: 0; }
 
 .cm-form { display: grid; gap: 12px; }
 .cm-form label { display: grid; gap: 6px; color: #3d3d3d; font-size: 13px; }
@@ -408,7 +398,7 @@
 .cm-foot li { margin: 6px 0; }
 
 @media (max-width: 1180px) {
-  .cm-hero, .cm-values, .cm-grid, .cm-prices, .cm-foot, .cm-custom, .cm-tester { grid-template-columns: 1fr 1fr; }
+  .cm-hero, .cm-values, .cm-grid, .cm-prices, .cm-foot, .cm-custom { grid-template-columns: 1fr 1fr; }
   .cm-prices { grid-template-columns: 1fr 1fr; }
   .cm-steps,
   .cm-steps-flow { grid-template-columns: 1fr; }
@@ -433,7 +423,7 @@
 }
 
 @media (max-width: 680px) {
-  .cm-hero, .cm-values, .cm-grid, .cm-prices, .cm-foot, .cm-custom, .cm-tester { grid-template-columns: 1fr; }
+  .cm-hero, .cm-values, .cm-grid, .cm-prices, .cm-foot, .cm-custom { grid-template-columns: 1fr; }
   .cm-wrap { width: min(1120px, calc(100% - 28px)); }
   .cm-close { padding: 40px 20px; }
 }
