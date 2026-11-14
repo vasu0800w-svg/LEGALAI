@@ -34,7 +34,7 @@ export function isUnlimitedEmail(email) {
 export const DEFAULT_FREE_PLAN_LIMITS = {
   draftLimit: 5,
   maxMessageChars: 10000,
-  maxSessionChars: 20000,
+  maxSessionChars: 50000,
   chatSessionLimit: 50,
   dailyUses: Number.POSITIVE_INFINITY,
   dailyAiRequests: 20,
@@ -57,7 +57,10 @@ export const sanitizeFreePlanLimits = (raw) => {
   return {
     draftLimit: clampLimit(src.draftLimit, DEFAULT_FREE_PLAN_LIMITS.draftLimit, 1, 500),
     maxMessageChars: clampLimit(src.maxMessageChars, DEFAULT_FREE_PLAN_LIMITS.maxMessageChars, 1000, 100000),
-    maxSessionChars: clampLimit(src.maxSessionChars, DEFAULT_FREE_PLAN_LIMITS.maxSessionChars, 4000, 500000),
+    maxSessionChars: Math.max(
+      clampLimit(src.maxSessionChars, DEFAULT_FREE_PLAN_LIMITS.maxSessionChars, 4000, 500000),
+      DEFAULT_FREE_PLAN_LIMITS.maxSessionChars
+    ),
     chatSessionLimit: clampLimit(src.chatSessionLimit, DEFAULT_FREE_PLAN_LIMITS.chatSessionLimit, 5, 5000),
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: clampLimit(src.dailyAiRequests, DEFAULT_FREE_PLAN_LIMITS.dailyAiRequests, 1, 500),
@@ -75,7 +78,7 @@ export const LEGACY_PAID_LIMITS = {
   starter: {
     draftLimit: 30,
     maxMessageChars: 10000,
-    maxSessionChars: 40000,
+    maxSessionChars: 100000,
     chatSessionLimit: 100,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -89,7 +92,7 @@ export const LEGACY_PAID_LIMITS = {
   basic: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 10000,
-    maxSessionChars: 60000,
+    maxSessionChars: 300000,
     chatSessionLimit: 200,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -103,7 +106,7 @@ export const LEGACY_PAID_LIMITS = {
   pro: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 20000,
-    maxSessionChars: 120000,
+    maxSessionChars: 500000,
     chatSessionLimit: 500,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -122,7 +125,7 @@ const DEFAULT_PAID_LIMITS = {
   starter: {
     draftLimit: 30,
     maxMessageChars: 10000,
-    maxSessionChars: 40000,
+    maxSessionChars: 100000,
     chatSessionLimit: 100,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -136,7 +139,7 @@ const DEFAULT_PAID_LIMITS = {
   basic: {
     draftLimit: 50,
     maxMessageChars: 10000,
-    maxSessionChars: 60000,
+    maxSessionChars: 300000,
     chatSessionLimit: 200,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -150,7 +153,7 @@ const DEFAULT_PAID_LIMITS = {
   pro: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 20000,
-    maxSessionChars: 120000,
+    maxSessionChars: 500000,
     chatSessionLimit: 500,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -179,6 +182,9 @@ const mergePaid = (raw) => {
     const hit = raw[id];
     if (!hit || typeof hit !== 'object') continue;
     out[id] = { ...out[id], ...hit, dailyUses: Number.POSITIVE_INFINITY };
+    const floor = Number(DEFAULT_PAID_LIMITS[id].maxSessionChars);
+    const n = Number(out[id].maxSessionChars);
+    if (Number.isFinite(floor) && Number.isFinite(n) && floor > n) out[id].maxSessionChars = floor;
   }
   return out;
 };

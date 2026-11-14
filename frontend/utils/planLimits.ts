@@ -87,13 +87,13 @@ const UNLIMITED_LIMITS: PlanLimits = {
 
 /**
  * Free-plan defaults. Admin config may override these.
- * Session characters stay at 20,000 (already more generous than a 10,000-character chat cap).
+ * Session characters stay at 50,000 (already more generous than a 10,000-character chat cap).
  * Per-message characters are raised to 10,000 so a case note can be pasted in one go.
  */
 export const DEFAULT_FREE_PLAN_LIMITS: PlanLimits = {
   draftLimit: 5,
   maxMessageChars: 10_000,
-  maxSessionChars: 20_000,
+  maxSessionChars: 50_000,
   chatSessionLimit: 50,
   dailyUses: Number.POSITIVE_INFINITY,
   dailyAiRequests: 20,
@@ -118,7 +118,10 @@ export const sanitizeFreePlanLimits = (
   return {
     draftLimit: clampLimit(src.draftLimit, DEFAULT_FREE_PLAN_LIMITS.draftLimit, 1, 500),
     maxMessageChars: clampLimit(src.maxMessageChars, DEFAULT_FREE_PLAN_LIMITS.maxMessageChars, 1000, 100_000),
-    maxSessionChars: clampLimit(src.maxSessionChars, DEFAULT_FREE_PLAN_LIMITS.maxSessionChars, 4000, 500_000),
+    maxSessionChars: Math.max(
+      clampLimit(src.maxSessionChars, DEFAULT_FREE_PLAN_LIMITS.maxSessionChars, 4000, 500_000),
+      DEFAULT_FREE_PLAN_LIMITS.maxSessionChars
+    ),
     chatSessionLimit: clampLimit(src.chatSessionLimit, DEFAULT_FREE_PLAN_LIMITS.chatSessionLimit, 5, 5000),
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: clampLimit(src.dailyAiRequests, DEFAULT_FREE_PLAN_LIMITS.dailyAiRequests, 1, 500),
@@ -139,7 +142,7 @@ export const LEGACY_PAID_LIMITS: Record<PaidPlanId, PlanLimits> = {
   starter: {
     draftLimit: 30,
     maxMessageChars: 10000,
-    maxSessionChars: 40000,
+    maxSessionChars: 100000,
     chatSessionLimit: 100,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -153,7 +156,7 @@ export const LEGACY_PAID_LIMITS: Record<PaidPlanId, PlanLimits> = {
   basic: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 10000,
-    maxSessionChars: 60000,
+    maxSessionChars: 300000,
     chatSessionLimit: 200,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -167,7 +170,7 @@ export const LEGACY_PAID_LIMITS: Record<PaidPlanId, PlanLimits> = {
   pro: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 20000,
-    maxSessionChars: 120000,
+    maxSessionChars: 500000,
     chatSessionLimit: 500,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -181,7 +184,7 @@ export const LEGACY_PAID_LIMITS: Record<PaidPlanId, PlanLimits> = {
   annual: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 20000,
-    maxSessionChars: 120000,
+    maxSessionChars: 500000,
     chatSessionLimit: 500,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -199,7 +202,7 @@ export const DEFAULT_PAID_LIMITS: Record<PaidPlanId, PlanLimits> = {
   basic: {
     draftLimit: 50,
     maxMessageChars: 10000,
-    maxSessionChars: 60000,
+    maxSessionChars: 300000,
     chatSessionLimit: 200,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -213,7 +216,7 @@ export const DEFAULT_PAID_LIMITS: Record<PaidPlanId, PlanLimits> = {
   pro: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 20000,
-    maxSessionChars: 120000,
+    maxSessionChars: 500000,
     chatSessionLimit: 500,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -227,7 +230,7 @@ export const DEFAULT_PAID_LIMITS: Record<PaidPlanId, PlanLimits> = {
   annual: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 20000,
-    maxSessionChars: 120000,
+    maxSessionChars: 500000,
     chatSessionLimit: 500,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -290,11 +293,18 @@ export const applyPaidPlanConfig = (raw: Record<string, Partial<PlanLimits>> | n
     paidPlanOverride = null;
     return;
   }
+  const mergePaid = (id: PaidPlanId, hit: Partial<PlanLimits> | undefined): PlanLimits => {
+    const merged = { ...DEFAULT_PAID_LIMITS[id], ...(hit || {}) };
+    const floor = DEFAULT_PAID_LIMITS[id].maxSessionChars;
+    const n = Number(merged.maxSessionChars);
+    if (Number.isFinite(floor) && Number.isFinite(n) && floor > n) merged.maxSessionChars = floor;
+    return merged;
+  };
   paidPlanOverride = {
-    starter: { ...DEFAULT_PAID_LIMITS.starter, ...(raw.starter || {}) },
-    basic: { ...DEFAULT_PAID_LIMITS.basic, ...(raw.basic || {}) },
-    pro: { ...DEFAULT_PAID_LIMITS.pro, ...(raw.pro || {}) },
-    annual: { ...DEFAULT_PAID_LIMITS.annual, ...(raw.annual || {}) },
+    starter: mergePaid('starter', raw.starter),
+    basic: mergePaid('basic', raw.basic),
+    pro: mergePaid('pro', raw.pro),
+    annual: mergePaid('annual', raw.annual),
   };
 };
 
@@ -537,6 +547,9 @@ export const getPlanLimits = (plan?: string | null, email?: string | null, promo
       for (const [key, value] of Object.entries(granted)) {
         (limits as unknown as Record<string, number>)[key] = value == null ? Number.POSITIVE_INFINITY : Number(value);
       }
+      const floor = Number(catalogLimits.maxSessionChars);
+      const n = Number(limits.maxSessionChars);
+      if (Number.isFinite(floor) && Number.isFinite(n) && floor > n) limits.maxSessionChars = floor;
     } else {
       const expiry = Number(promo?.subscriptionExpiryDate || 0);
       const active = expiry > Date.now();

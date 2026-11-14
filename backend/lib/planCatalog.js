@@ -47,7 +47,7 @@ export const DEFAULT_PAID_LIMITS = {
   starter: {
     draftLimit: 30,
     maxMessageChars: 10000,
-    maxSessionChars: 40000,
+    maxSessionChars: 100000,
     chatSessionLimit: 100,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -61,7 +61,7 @@ export const DEFAULT_PAID_LIMITS = {
   basic: {
     draftLimit: 50,
     maxMessageChars: 10000,
-    maxSessionChars: 60000,
+    maxSessionChars: 300000,
     chatSessionLimit: 200,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -75,7 +75,7 @@ export const DEFAULT_PAID_LIMITS = {
   pro: {
     draftLimit: Number.POSITIVE_INFINITY,
     maxMessageChars: 20000,
-    maxSessionChars: 120000,
+    maxSessionChars: 500000,
     chatSessionLimit: 500,
     dailyUses: Number.POSITIVE_INFINITY,
     dailyAiRequests: Number.POSITIVE_INFINITY,
@@ -158,7 +158,11 @@ export const sanitizePaidLimits = (raw) => {
       ...base,
       draftLimit: finiteOr(hit.draftLimit, base.draftLimit),
       maxMessageChars: finiteOr(hit.maxMessageChars, base.maxMessageChars),
-      maxSessionChars: finiteOr(hit.maxSessionChars, base.maxSessionChars),
+      maxSessionChars: (() => {
+        const n = finiteOr(hit.maxSessionChars, base.maxSessionChars);
+        const floor = Number(base.maxSessionChars);
+        return Number.isFinite(floor) && Number.isFinite(n) && floor > n ? floor : n;
+      })(),
       chatSessionLimit: finiteOr(hit.chatSessionLimit, base.chatSessionLimit),
       dailyAiRequests: finiteOr(hit.dailyAiRequests, base.dailyAiRequests),
       dailySeconds: finiteOr(hit.dailySeconds, base.dailySeconds),

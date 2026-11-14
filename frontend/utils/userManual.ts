@@ -56,8 +56,8 @@ export const userManual: Record<string, { heading: string; intro: string; sectio
         title: '6. Plans and limits',
         paragraphs: [
           'Free: 1 hour per day and 5 drafts per month, with character and photo limits per chat.',
-          'Casemate Starter ₹999/month: 30 completed drafts, 50 photos per upload, no per-chat photo cap, 40,000 characters per chat, no daily AI cap, up to 2 devices.',
-          'Casemate Basic ₹2,999/month: 50 completed drafts, 80 photos per upload, 60,000 characters per chat, up to 3 devices.',
+          'Casemate Starter ₹999/month: 30 completed drafts, 50 photos per upload, no per-chat photo cap, 1,00,000 characters per chat, no daily AI cap, up to 2 devices.',
+          'Casemate Basic ₹2,999/month: 50 completed drafts, 80 photos per upload, 3,00,000 characters per chat, up to 3 devices.',
           'Casemate Pro ₹4,999/month: unlimited drafts under monthly AI fair use, about 200 photos per upload, larger chats, up to 5 devices.',
           'Annual ₹34,990/year is the same as Pro. Twelve months of Pro is ₹59,988, so the annual saving is ₹24,998 (about 41.7%) before tax.',
           'Pay with Razorpay. Access lasts until the date stored on the account. There is no automatic renewal in the app.',
@@ -125,8 +125,8 @@ export const userManual: Record<string, { heading: string; intro: string; sectio
         title: '6. योजनाएँ और सीमाएँ',
         paragraphs: [
           'मुफ़्त: प्रतिदिन 1 घंटा और महीने में 5 ड्राफ्ट, चैट की वर्ण और फ़ोटो सीमा के साथ।',
-          'Casemate Starter ₹999/माह: 30 पूर्ण ड्राफ्ट, प्रति अपलोड 50 फ़ोटो, चैट पर फ़ोटो सीमा नहीं, 40,000 अक्षर प्रति चैट, दैनिक AI सीमा नहीं, अधिकतम 2 डिवाइस।',
-          'Casemate Basic ₹2,999/माह: 50 पूर्ण ड्राफ्ट, प्रति अपलोड 80 फ़ोटो, 60,000 अक्षर प्रति चैट, अधिकतम 3 डिवाइस।',
+          'Casemate Starter ₹999/माह: 30 पूर्ण ड्राफ्ट, प्रति अपलोड 50 फ़ोटो, चैट पर फ़ोटो सीमा नहीं, 1,00,000 अक्षर प्रति चैट, दैनिक AI सीमा नहीं, अधिकतम 2 डिवाइस।',
+          'Casemate Basic ₹2,999/माह: 50 पूर्ण ड्राफ्ट, प्रति अपलोड 80 फ़ोटो, 3,00,000 अक्षर प्रति चैट, अधिकतम 3 डिवाइस।',
           'Casemate Pro ₹4,999/माह: मासिक AI उचित-उपयोग के अधीन असीमित ड्राफ्ट, प्रति अपलोड लगभग 200 फ़ोटो, बड़ी चैट, अधिकतम 5 डिवाइस।',
           'वार्षिक ₹34,990/वर्ष प्रो के समान है। बारह महीने का प्रो ₹59,988 है, वार्षिक बचत ₹24,998 (लगभग 41.7%) कर से पहले।',
           'भुगतान Razorpay से। पहुँच खाते पर दर्ज तिथि तक रहती है। ऐप में स्वतः नवीनीकरण नहीं है।',

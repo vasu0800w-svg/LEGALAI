@@ -91,14 +91,21 @@ export const resolvePaidLimits = ({
   legacyLimits,
   now = Date.now(),
 }) => {
+  let limits;
   if (grantedLimits && typeof grantedLimits === 'object' && Object.keys(grantedLimits).length > 0) {
-    return reviveLimits(grantedLimits, catalogLimits);
+    limits = reviveLimits(grantedLimits, catalogLimits);
+  } else {
+    const active = String(plan || 'free') !== 'free' && Number(expiry) > now;
+    limits = active && Number(entitlementsVersion) !== CATALOG_VERSION
+      ? { ...legacyLimits }
+      : { ...catalogLimits };
   }
-  const active = String(plan || 'free') !== 'free' && Number(expiry) > now;
-  if (active && Number(entitlementsVersion) !== CATALOG_VERSION) {
-    return { ...legacyLimits };
+  const floor = Number(catalogLimits?.maxSessionChars);
+  const n = Number(limits?.maxSessionChars);
+  if (Number.isFinite(floor) && Number.isFinite(n) && floor > n) {
+    limits = { ...limits, maxSessionChars: floor };
   }
-  return { ...catalogLimits };
+  return limits;
 };
 
 export const countMessageChars = (messages = []) =>
